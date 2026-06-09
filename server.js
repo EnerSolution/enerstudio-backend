@@ -76,7 +76,7 @@ app.post('/api/runway/generate', async (req, res) => {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: 'gen4_turbo',
+        model: 'gen4.5',
         promptText: prompt + ', cinematic, professional, photorealistic',
         duration: 5,
         ratio: '1280:720'
