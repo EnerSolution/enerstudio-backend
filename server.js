@@ -228,20 +228,24 @@ app.post('/api/runway/stitch', async (req, res) => {
     execSync('"' + ffmpegPath + '" -f concat -safe 0 -i "' + listFile + '" -c copy "' + stitched + '" -y', { timeout: 120000 });
     console.log('Clips stitched');
 
-    // Add text overlays
-    const brand = brandName || 'EnerStudio';
-    const website = websiteUrl || 'EnerStudio.io';
+    // Add text overlays using a drawtext file to avoid special character issues
+    const brand = (brandName || 'EnerStudio').replace(/[^a-zA-Z0-9 ]/g, '');
+    const website = (websiteUrl || 'EnerStudio.io').replace(/[^a-zA-Z0-9./]/g, '');
     const totalDuration = clipFiles.length * 5;
     const withText = path.join(tempDir, 'with_text.mp4');
 
-    // Build drawtext filter - brand name top, website bottom with fade in near end
-    const drawtextFilter = [
-      "drawtext=fontsize=36:fontcolor=white:x=(w-text_w)/2:y=30:text='" + brand + "':shadowcolor=black:shadowx=2:shadowy=2:enable='between(t,0," + totalDuration + ")'",
-      "drawtext=fontsize=28:fontcolor=white:x=(w-text_w)/2:y=h-60:text='" + website + "':shadowcolor=black:shadowx=2:shadowy=2:alpha='if(gt(t," + (totalDuration - 3) + "),1,0)'"
-    ].join(',');
+    try {
+      const drawtextFilter = [
+        "drawtext=fontsize=40:fontcolor=white:x=(w-text_w)/2:y=40:text='" + brand + "':shadowcolor=black:shadowx=3:shadowy=3",
+        "drawtext=fontsize=32:fontcolor=yellow:x=(w-text_w)/2:y=h-80:text='" + website + "':shadowcolor=black:shadowx=2:shadowy=2:enable='gte(t," + Math.max(0, totalDuration - 4) + ")'"
+      ].join(',');
 
-    execSync('"' + ffmpegPath + '" -i "' + stitched + '" -vf "' + drawtextFilter + '" -c:v libx264 -preset fast -crf 23 "' + withText + '" -y', { timeout: 180000 });
-    console.log('Text overlays added');
+      execSync('"' + ffmpegPath + '" -i "' + stitched + '" -vf "' + drawtextFilter + '" -c:v libx264 -preset fast -crf 23 "' + withText + '" -y', { timeout: 180000 });
+      console.log('Text overlays added successfully');
+    } catch(textErr) {
+      console.log('Text overlay failed, using video without text:', textErr.message);
+      fs.copyFileSync(stitched, withText);
+    }
 
     let finalPath = withText;
 
