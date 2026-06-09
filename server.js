@@ -204,19 +204,28 @@ app.post('/api/runway/stitch', async (req, res) => {
     const withText = path.join(tempDir, 'with_text.mp4');
 
     try {
+      // Write text to files to avoid shell escaping issues
+      const brandTextFile = path.join(tempDir, 'brand.txt');
+      const websiteTextFile = path.join(tempDir, 'website.txt');
+      fs.writeFileSync(brandTextFile, brand);
+      fs.writeFileSync(websiteTextFile, website);
+
+      // Try with DejaVu font (available on Render Ubuntu)
+      const fontPath = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
       const drawtextFilter = [
-        "drawtext=fontsize=40:fontcolor=white:x=(w-text_w)/2:y=40:text='" + brand + "':shadowcolor=black:shadowx=3:shadowy=3",
-        "drawtext=fontsize=32:fontcolor=yellow:x=(w-text_w)/2:y=h-80:text='" + website + "':shadowcolor=black:shadowx=2:shadowy=2:enable='gte(t," + Math.max(0, totalDuration - 4) + ")'"
+        "drawtext=fontfile='" + fontPath + "':fontsize=44:fontcolor=white:x=(w-text_w)/2:y=40:textfile='" + brandTextFile + "':shadowcolor=black:shadowx=3:shadowy=3",
+        "drawtext=fontfile='" + fontPath + "':fontsize=32:fontcolor=yellow:x=(w-text_w)/2:y=h-70:textfile='" + websiteTextFile + "':shadowcolor=black:shadowx=2:shadowy=2:enable='gte(t," + Math.max(0, totalDuration - 5) + ")'"
       ].join(',');
 
       execSync('"' + ffmpegPath + '" -i "' + stitched + '" -vf "' + drawtextFilter + '" -c:v libx264 -preset fast -crf 23 "' + withText + '" -y', { timeout: 180000 });
       console.log('Text overlays added successfully');
     } catch(textErr) {
-      console.log('Text overlay failed, using video without text:', textErr.message);
+      console.log('Text overlay failed:', textErr.message.substring(0,200));
+      console.log('Continuing without text overlay');
       fs.copyFileSync(stitched, withText);
     }
 
-    let finalPath = withText;
+        let finalPath = withText;
 
     // Add voiceover
     if (audioFile && fs.existsSync(audioFile)) {
