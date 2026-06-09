@@ -153,7 +153,7 @@ app.post('/api/runway/generate', async (req, res) => {
     if (!imgRes.ok) throw new Error('Image gen failed: ' + JSON.stringify(imgData));
     
     // Step 2: Poll for image
-    let imageUrl = null;
+    let generatedImageUrl = null;
     for (let i = 0; i < 20; i++) {
       await new Promise(r => setTimeout(r, 3000));
       const statusRes = await fetch('https://api.dev.runwayml.com/v1/tasks/' + imgData.id, {
@@ -161,13 +161,13 @@ app.post('/api/runway/generate', async (req, res) => {
       });
       const statusData = await statusRes.json();
       if (statusData.status === 'SUCCEEDED' && statusData.output?.[0]) {
-        imageUrl = statusData.output[0];
-        console.log('Image ready:', imageUrl.substring(0, 60));
+        generatedImageUrl = statusData.output[0];
+        console.log('Image ready:', generatedImageUrl.substring(0, 60));
         break;
       }
       if (statusData.status === 'FAILED') throw new Error('Image failed');
     }
-    if (!imageUrl) throw new Error('Image timeout');
+    if (!generatedImageUrl) throw new Error('Image timeout');
 
     // Step 3: Generate video with gen4_turbo (5 credits/sec = cheap)
     console.log('Generating video from image...');
@@ -180,7 +180,7 @@ app.post('/api/runway/generate', async (req, res) => {
       },
       body: JSON.stringify({
         model: 'gen4_turbo',
-        promptImage: imageUrl,
+        promptImage: generatedImageUrl,
         promptText: prompt + ', smooth cinematic camera movement',
         duration: 5,
         ratio: '1280:720'
