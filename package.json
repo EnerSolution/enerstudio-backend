@@ -1,12 +1,13 @@
 {
   "name": "enerstudio-backend",
-  "version": "2.0.0",
+  "version": "4.0.0",
   "description": "EnerStudio.io AI Video Production Backend",
   "main": "server.js",
   "engines": {
     "node": ">=18.0.0"
   },
   "scripts": {
+    "build": "apt-get install -y ffmpeg || true",
     "start": "node server.js"
   },
   "dependencies": {
