@@ -14,7 +14,7 @@ app.use(express.json({ limit: '10mb' }));
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '3.0.0',
+    version: '4.0.0',
     keys: {
       anthropic: ANTHROPIC_KEY ? 'SET (' + ANTHROPIC_KEY.substring(0,10) + '...)' : 'MISSING',
       runway: RUNWAY_KEY ? 'SET (' + RUNWAY_KEY.substring(0,10) + '...)' : 'MISSING',
