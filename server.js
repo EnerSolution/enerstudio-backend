@@ -61,59 +61,14 @@ app.get('/api/runway/balance', async (req, res) => {
   }
 });
 
-// Generate image using Runway then use it for video
 app.post('/api/runway/generate', async (req, res) => {
   try {
-    const { prompt, imageUrl } = req.body;
+    const { prompt } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
 
-    // Step 1: Generate image using Runway Gen4 image model
-    console.log('Generating image for prompt:', prompt.substring(0, 60));
-    const imgResponse = await fetch('https://api.dev.runwayml.com/v1/text_to_image', {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + RUNWAY_KEY,
-        'X-Runway-Version': '2024-11-06',
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'gen4_image',
-        promptText: prompt + ', photorealistic, cinematic, professional photography',
-        ratio: '1280:720'
-      })
-    });
-    const imgData = await imgResponse.json();
-    console.log('Image generation response:', JSON.stringify(imgData).substring(0, 200));
-
-    let generatedImageUrl = null;
-
-    if (imgResponse.ok && imgData.id) {
-      // Poll for image completion
-      let imgTaskId = imgData.id;
-      for (let i = 0; i < 30; i++) {
-        await new Promise(r => setTimeout(r, 3000));
-        const statusRes = await fetch('https://api.dev.runwayml.com/v1/tasks/' + imgTaskId, {
-          headers: { 'Authorization': 'Bearer ' + RUNWAY_KEY, 'X-Runway-Version': '2024-11-06' }
-        });
-        const statusData = await statusRes.json();
-        console.log('Image status:', statusData.status);
-        if (statusData.status === 'SUCCEEDED' && statusData.output && statusData.output[0]) {
-          generatedImageUrl = statusData.output[0];
-          console.log('Image ready:', generatedImageUrl.substring(0, 80));
-          break;
-        } else if (statusData.status === 'FAILED') {
-          throw new Error('Image generation failed: ' + JSON.stringify(statusData));
-        }
-      }
-    }
-
-    if (!generatedImageUrl) {
-      throw new Error('Could not generate image for video clip');
-    }
-
-    // Step 2: Use generated image for video
-    console.log('Generating video from Runway image...');
-    const videoResponse = await fetch('https://api.dev.runwayml.com/v1/image_to_video', {
+    // Use text_to_video directly - no image needed
+    console.log('Generating video from text prompt:', prompt.substring(0, 60));
+    const videoResponse = await fetch('https://api.dev.runwayml.com/v1/text_to_video', {
       method: 'POST',
       headers: {
         'Authorization': 'Bearer ' + RUNWAY_KEY,
@@ -122,15 +77,14 @@ app.post('/api/runway/generate', async (req, res) => {
       },
       body: JSON.stringify({
         model: 'gen4_turbo',
-        promptImage: generatedImageUrl,
-        promptText: prompt,
+        promptText: prompt + ', cinematic, professional, photorealistic',
         duration: 5,
         ratio: '1280:720'
       })
     });
     const videoData = await videoResponse.json();
+    console.log('Video response:', JSON.stringify(videoData).substring(0, 200));
     if (!videoResponse.ok) throw new Error(JSON.stringify(videoData));
-    console.log('Video task created:', videoData.id);
     res.json({ id: videoData.id, success: true });
   } catch (e) {
     console.error('Generate error:', e.message);
@@ -202,7 +156,22 @@ app.post('/api/runway/stitch', async (req, res) => {
             'Accept': 'audio/mpeg'
           },
           body: JSON.stringify({
-            text: voiceoverText.substring(0, 2000),
+            text: voiceoverText
+              .replace(/\[.*?\]/g, '')
+              .replace(/SCENE.*?:\s*/gi, '')
+              .replace(/HOOK.*?:\s*/gi, '')
+              .replace(/PROBLEM.*?:\s*/gi, '')
+              .replace(/SOLUTION.*?:\s*/gi, '')
+              .replace(/PROOF.*?:\s*/gi, '')
+              .replace(/CTA.*?:\s*/gi, '')
+              .replace(/VISUAL.*?:\n/gi, '')
+              .replace(/Style:.*?\n/gi, '')
+              .replace(/Open with.*?\n/gi, '')
+              .replace(/Show.*?\n/gi, '')
+              .replace(/\n+/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .substring(0, 2000),
             model_id: 'eleven_multilingual_v2',
             voice_settings: { stability: 0.5, similarity_boost: 0.75 }
           })
