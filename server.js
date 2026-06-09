@@ -1,27 +1,21 @@
 const express = require('express');
 const cors = require('cors');
-const fetch = require('node-fetch');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// API Keys from environment variables
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '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';
-const RUNWAY_KEY = process.env.RUNWAY_API_KEY || 'key_fd9392fd63f5816016460dc999ca909f9f5dd2969781368033ce5ef6ce65e91d6b6aff84525086e59c8add0aff097f540ef5979a1eaef775c28056b2d7f44748';
-const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY || 'sk_f5879a02e2ff031b0da44cc04cf76aec071d34a05a6101b7';
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const RUNWAY_KEY = process.env.RUNWAY_API_KEY;
+const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY;
 
-// CORS - allow all origins
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
+app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
 
-// Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'EnerStudio Backend Running', version: '1.0.0' });
+  res.json({ status: 'EnerStudio Backend Running', version: '2.0.0' });
 });
 
-// =====================
-// ANTHROPIC PROXY
-// =====================
+// ANTHROPIC
 app.post('/api/claude/generate', async (req, res) => {
   try {
     const { prompt, system } = req.body;
@@ -41,16 +35,13 @@ app.post('/api/claude/generate', async (req, res) => {
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error?.message || 'Anthropic error ' + response.status);
-    const text = data.content?.[0]?.text || '';
-    res.json({ text, success: true });
+    res.json({ text: data.content?.[0]?.text || '', success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// =====================
-// RUNWAY PROXY
-// =====================
+// RUNWAY BALANCE
 app.get('/api/runway/balance', async (req, res) => {
   try {
     const response = await fetch('https://api.dev.runwayml.com/v1/organization', {
@@ -66,10 +57,11 @@ app.get('/api/runway/balance', async (req, res) => {
   }
 });
 
+// RUNWAY GENERATE
 app.post('/api/runway/generate', async (req, res) => {
   try {
     const { prompt, imageUrl } = req.body;
-    if (!prompt || !imageUrl) return res.status(400).json({ error: 'prompt and imageUrl are required' });
+    if (!prompt || !imageUrl) return res.status(400).json({ error: 'prompt and imageUrl required' });
     const response = await fetch('https://api.dev.runwayml.com/v1/image_to_video', {
       method: 'POST',
       headers: {
@@ -93,6 +85,7 @@ app.post('/api/runway/generate', async (req, res) => {
   }
 });
 
+// RUNWAY STATUS
 app.get('/api/runway/status/:taskId', async (req, res) => {
   try {
     const response = await fetch('https://api.dev.runwayml.com/v1/tasks/' + req.params.taskId, {
@@ -108,9 +101,7 @@ app.get('/api/runway/status/:taskId', async (req, res) => {
   }
 });
 
-// =====================
-// ELEVENLABS PROXY
-// =====================
+// ELEVENLABS GENERATE
 app.post('/api/voice/generate', async (req, res) => {
   try {
     const { text, voice_id } = req.body;
@@ -129,27 +120,14 @@ app.post('/api/voice/generate', async (req, res) => {
       })
     });
     if (!response.ok) throw new Error('ElevenLabs error ' + response.status);
-    const buffer = await response.buffer();
+    const buffer = await response.arrayBuffer();
     res.set('Content-Type', 'audio/mpeg');
-    res.set('Content-Disposition', 'attachment; filename="voiceover.mp3"');
-    res.send(buffer);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get('/api/voice/list', async (req, res) => {
-  try {
-    const response = await fetch('https://api.elevenlabs.io/v2/voices', {
-      headers: { 'xi-api-key': ELEVENLABS_KEY }
-    });
-    const data = await response.json();
-    res.json(data);
+    res.send(Buffer.from(buffer));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
 app.listen(PORT, () => {
-  console.log('EnerStudio Backend running on port ' + PORT);
+  console.log('EnerStudio Backend v2.0 running on port ' + PORT);
 });
