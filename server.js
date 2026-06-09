@@ -19,7 +19,7 @@ app.use(express.json({ limit: '50mb' }));
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '5.0.0',
+    version: '6.0.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -99,35 +99,52 @@ app.get('/api/runway/status/:taskId', async (req, res) => {
   }
 });
 
+// Get first available ElevenLabs voice
+async function getFirstVoice() {
+  try {
+    const r = await fetch('https://api.elevenlabs.io/v2/voices?page_size=1', {
+      headers: { 'xi-api-key': ELEVENLABS_KEY }
+    });
+    const data = await r.json();
+    const voices = data.voices || data.results || [];
+    if (voices.length > 0) return voices[0].voice_id;
+  } catch(e) {
+    console.log('Could not fetch voices:', e.message);
+  }
+  return null;
+}
+
 app.post('/api/runway/stitch', async (req, res) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enerstudio-'));
   try {
-    const { clipUrls, voiceoverText } = req.body;
+    const { clipUrls, voiceoverText, brandName, websiteUrl } = req.body;
     if (!clipUrls || clipUrls.length === 0) {
       return res.status(400).json({ error: 'No clip URLs provided' });
     }
 
-    console.log('Starting stitch of', clipUrls.length, 'clips. FFmpeg path:', ffmpegPath);
+    console.log('Stitching', clipUrls.length, 'clips. FFmpeg:', ffmpegPath);
 
     // Download all clips
     const clipFiles = [];
     for (let i = 0; i < clipUrls.length; i++) {
       const clipPath = path.join(tempDir, 'clip' + i + '.mp4');
-      console.log('Downloading clip', i + 1, 'from', clipUrls[i].substring(0, 50));
       const r = await fetch(clipUrls[i]);
-      if (!r.ok) throw new Error('Failed to download clip ' + i + ' status ' + r.status);
-      const buf = await r.arrayBuffer();
-      fs.writeFileSync(clipPath, Buffer.from(buf));
+      if (!r.ok) throw new Error('Clip ' + i + ' download failed: ' + r.status);
+      fs.writeFileSync(clipPath, Buffer.from(await r.arrayBuffer()));
       clipFiles.push(clipPath);
-      console.log('Clip', i + 1, 'downloaded:', buf.byteLength, 'bytes');
+      console.log('Downloaded clip', i + 1);
     }
 
-    // Generate voiceover with ElevenLabs
+    // Generate voiceover
     let audioFile = null;
     if (voiceoverText && ELEVENLABS_KEY) {
       try {
-        console.log('Generating voiceover...');
-        const vr = await fetch('https://api.elevenlabs.io/v1/text-to-speech/f38a635bee7a4d1f9b0a654a31d050d2', {
+        console.log('Getting voice ID...');
+        let voiceId = await getFirstVoice();
+        if (!voiceId) voiceId = 'EXAVITQu4vr4xnSDxMaL'; // fallback Sarah voice
+        console.log('Using voice ID:', voiceId);
+
+        const vr = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + voiceId, {
           method: 'POST',
           headers: {
             'xi-api-key': ELEVENLABS_KEY,
@@ -136,47 +153,58 @@ app.post('/api/runway/stitch', async (req, res) => {
           },
           body: JSON.stringify({
             text: voiceoverText.substring(0, 2000),
-            model_id: 'eleven_monolingual_v1',
+            model_id: 'eleven_multilingual_v2',
             voice_settings: { stability: 0.5, similarity_boost: 0.75 }
           })
         });
         if (vr.ok) {
           audioFile = path.join(tempDir, 'voice.mp3');
-          fs.writeFileSync(audioFile, Buffer.from(await vr.arrayBuffer()));
-          console.log('Voiceover generated successfully');
+          const audioBuf = await vr.arrayBuffer();
+          fs.writeFileSync(audioFile, Buffer.from(audioBuf));
+          console.log('Voiceover generated:', audioBuf.byteLength, 'bytes');
         } else {
-          console.log('Voiceover failed:', vr.status);
+          const errText = await vr.text();
+          console.log('Voiceover failed:', vr.status, errText.substring(0, 200));
         }
       } catch (e) {
         console.log('Voice error:', e.message);
       }
     }
 
-    // Create concat file list
+    // Stitch clips
     const listFile = path.join(tempDir, 'list.txt');
-    fs.writeFileSync(listFile, clipFiles.map(function(f) { return "file '" + f + "'"; }).join('\n'));
-    console.log('List file created:', fs.readFileSync(listFile, 'utf8'));
-
-    // Stitch clips with ffmpeg-static
+    fs.writeFileSync(listFile, clipFiles.map(f => "file '" + f + "'").join('\n'));
     const stitched = path.join(tempDir, 'stitched.mp4');
-    const stitchCmd = '"' + ffmpegPath + '" -f concat -safe 0 -i "' + listFile + '" -c copy "' + stitched + '" -y';
-    console.log('Running stitch command:', stitchCmd);
-    execSync(stitchCmd, { timeout: 120000 });
-    console.log('Stitch complete. Size:', fs.statSync(stitched).size);
+    execSync('"' + ffmpegPath + '" -f concat -safe 0 -i "' + listFile + '" -c copy "' + stitched + '" -y', { timeout: 120000 });
+    console.log('Clips stitched');
 
-    let finalPath = stitched;
+    // Add text overlays
+    const brand = brandName || 'EnerStudio';
+    const website = websiteUrl || 'EnerStudio.io';
+    const totalDuration = clipFiles.length * 5;
+    const withText = path.join(tempDir, 'with_text.mp4');
 
-    // Add voiceover if available
+    // Build drawtext filter - brand name top, website bottom with fade in near end
+    const drawtextFilter = [
+      "drawtext=fontsize=36:fontcolor=white:x=(w-text_w)/2:y=30:text='" + brand + "':shadowcolor=black:shadowx=2:shadowy=2:enable='between(t,0," + totalDuration + ")'",
+      "drawtext=fontsize=28:fontcolor=white:x=(w-text_w)/2:y=h-60:text='" + website + "':shadowcolor=black:shadowx=2:shadowy=2:alpha='if(gt(t," + (totalDuration - 3) + "),1,0)'"
+    ].join(',');
+
+    execSync('"' + ffmpegPath + '" -i "' + stitched + '" -vf "' + drawtextFilter + '" -c:v libx264 -preset fast -crf 23 "' + withText + '" -y', { timeout: 180000 });
+    console.log('Text overlays added');
+
+    let finalPath = withText;
+
+    // Add voiceover
     if (audioFile && fs.existsSync(audioFile)) {
       const withAudio = path.join(tempDir, 'final.mp4');
-      const audioCmd = '"' + ffmpegPath + '" -i "' + stitched + '" -i "' + audioFile + '" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "' + withAudio + '" -y';
-      console.log('Adding audio...');
-      execSync(audioCmd, { timeout: 120000 });
+      execSync('"' + ffmpegPath + '" -i "' + withText + '" -i "' + audioFile + '" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "' + withAudio + '" -y', { timeout: 120000 });
       finalPath = withAudio;
-      console.log('Audio added. Final size:', fs.statSync(withAudio).size);
+      console.log('Audio added to final video');
+    } else {
+      console.log('No audio file available - sending video without voiceover');
     }
 
-    // Send final video
     const finalVideo = fs.readFileSync(finalPath);
     console.log('Sending final video:', finalVideo.length, 'bytes');
     res.set('Content-Type', 'video/mp4');
@@ -194,7 +222,8 @@ app.post('/api/runway/stitch', async (req, res) => {
 app.post('/api/voice/generate', async (req, res) => {
   try {
     const { text, voice_id } = req.body;
-    const vid = voice_id || 'f38a635bee7a4d1f9b0a654a31d050d2';
+    let vid = voice_id;
+    if (!vid) vid = await getFirstVoice() || 'EXAVITQu4vr4xnSDxMaL';
     const response = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + vid, {
       method: 'POST',
       headers: {
@@ -204,7 +233,7 @@ app.post('/api/voice/generate', async (req, res) => {
       },
       body: JSON.stringify({
         text: text,
-        model_id: 'eleven_monolingual_v1',
+        model_id: 'eleven_multilingual_v2',
         voice_settings: { stability: 0.5, similarity_boost: 0.75 }
       })
     });
@@ -218,7 +247,7 @@ app.post('/api/voice/generate', async (req, res) => {
 });
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v5.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v6.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
