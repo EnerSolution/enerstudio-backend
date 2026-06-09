@@ -12,13 +12,27 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
 
 app.get('/', (req, res) => {
-  res.json({ status: 'EnerStudio Backend Running', version: '2.0.0' });
+  res.json({ 
+    status: 'EnerStudio Backend Running', 
+    version: '3.0.0',
+    keys: {
+      anthropic: ANTHROPIC_KEY ? 'SET (' + ANTHROPIC_KEY.substring(0,10) + '...)' : 'MISSING',
+      runway: RUNWAY_KEY ? 'SET (' + RUNWAY_KEY.substring(0,10) + '...)' : 'MISSING',
+      elevenlabs: ELEVENLABS_KEY ? 'SET (' + ELEVENLABS_KEY.substring(0,10) + '...)' : 'MISSING'
+    }
+  });
 });
 
 // ANTHROPIC
 app.post('/api/claude/generate', async (req, res) => {
   try {
+    console.log('Claude generate called');
+    console.log('ANTHROPIC_KEY exists:', !!ANTHROPIC_KEY);
+    console.log('ANTHROPIC_KEY prefix:', ANTHROPIC_KEY ? ANTHROPIC_KEY.substring(0,15) : 'MISSING');
+    
     const { prompt, system } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt is required' });
+    
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -33,10 +47,15 @@ app.post('/api/claude/generate', async (req, res) => {
         messages: [{ role: 'user', content: prompt }]
       })
     });
+    
     const data = await response.json();
-    if (!response.ok) throw new Error(data.error?.message || 'Anthropic error ' + response.status);
+    console.log('Anthropic response status:', response.status);
+    console.log('Anthropic response:', JSON.stringify(data).substring(0, 200));
+    
+    if (!response.ok) throw new Error('Anthropic error ' + response.status + ': ' + JSON.stringify(data));
     res.json({ text: data.content?.[0]?.text || '', success: true });
   } catch (e) {
+    console.error('Claude generate error:', e.message);
     res.status(500).json({ error: e.message });
   }
 });
@@ -101,7 +120,7 @@ app.get('/api/runway/status/:taskId', async (req, res) => {
   }
 });
 
-// ELEVENLABS GENERATE
+// ELEVENLABS
 app.post('/api/voice/generate', async (req, res) => {
   try {
     const { text, voice_id } = req.body;
@@ -129,5 +148,8 @@ app.post('/api/voice/generate', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log('EnerStudio Backend v2.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v3.0 running on port ' + PORT);
+  console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
+  console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
+  console.log('ELEVENLABS_KEY:', ELEVENLABS_KEY ? 'SET' : 'MISSING');
 });
