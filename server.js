@@ -41,7 +41,7 @@ app.post('/api/claude/generate', async (req, res) => {
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
+        model: 'claude-sonnet-4-5',
         max_tokens: 4000,
         system: system || 'You are a professional video script writer.',
         messages: [{ role: 'user', content: prompt }]
