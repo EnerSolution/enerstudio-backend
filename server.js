@@ -19,7 +19,7 @@ app.use(express.json({ limit: '50mb' }));
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '7.0.0',
+    version: '7.1.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -317,7 +317,8 @@ app.post('/api/runway/stitch', async (req, res) => {
     // Add voiceover
     if (audioFile && fs.existsSync(audioFile)) {
       const withAudio = path.join(tempDir, 'final.mp4');
-      execSync('"' + ffmpegPath + '" -i "' + withText + '" -i "' + audioFile + '" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "' + withAudio + '" -y', { timeout: 120000 });
+      const videoDuration = clipFiles.length * 5;
+      execSync('"' + ffmpegPath + '" -i "' + withText + '" -i "' + audioFile + '" -map 0:v -map 1:a -c:v copy -c:a aac -t ' + videoDuration + ' "' + withAudio + '" -y', { timeout: 120000 });
       finalPath = withAudio;
       console.log('Audio added to final video');
     } else {
@@ -378,7 +379,7 @@ app.post('/api/voice/generate', async (req, res) => {
 });
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v7.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v7.1 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
