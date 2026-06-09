@@ -19,7 +19,7 @@ app.use(express.json({ limit: '50mb' }));
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '6.0.0',
+    version: '7.0.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -61,14 +61,15 @@ app.get('/api/runway/balance', async (req, res) => {
   }
 });
 
-app.post('/api/runway/generate', async (req, res) => {
+
+// GENERATE SINGLE IMAGE via Runway gen4_image
+app.post('/api/runway/generate-image', async (req, res) => {
   try {
     const { prompt } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
+    console.log('Generating image for:', prompt.substring(0, 60));
 
-    // Use text_to_video directly - no image needed
-    console.log('Generating video from text prompt:', prompt.substring(0, 60));
-    const videoResponse = await fetch('https://api.dev.runwayml.com/v1/text_to_video', {
+    const imgRes = await fetch('https://api.dev.runwayml.com/v1/text_to_image', {
       method: 'POST',
       headers: {
         'Authorization': 'Bearer ' + RUNWAY_KEY,
@@ -76,16 +77,119 @@ app.post('/api/runway/generate', async (req, res) => {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: 'gen4.5',
-        promptText: prompt + ', cinematic, professional, photorealistic',
+        model: 'gen4_image',
+        promptText: prompt,
+        ratio: '1280:720'
+      })
+    });
+    const imgData = await imgRes.json();
+    if (!imgRes.ok) throw new Error('Image gen failed: ' + JSON.stringify(imgData));
+
+    // Poll for completion
+    for (let i = 0; i < 20; i++) {
+      await new Promise(r => setTimeout(r, 3000));
+      const s = await fetch('https://api.dev.runwayml.com/v1/tasks/' + imgData.id, {
+        headers: { 'Authorization': 'Bearer ' + RUNWAY_KEY, 'X-Runway-Version': '2024-11-06' }
+      });
+      const sd = await s.json();
+      if (sd.status === 'SUCCEEDED' && sd.output?.[0]) {
+        console.log('Image ready:', sd.output[0].substring(0, 60));
+        return res.json({ imageUrl: sd.output[0], success: true });
+      }
+      if (sd.status === 'FAILED') throw new Error('Image task failed');
+    }
+    throw new Error('Image generation timeout');
+  } catch (e) {
+    console.error('Image gen error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/runway/generate', async (req, res) => {
+  try {
+    const { prompt, imageUrl } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+    // If imageUrl provided (pre-generated Runway image), use directly
+    if (imageUrl) {
+      console.log('Using provided image URL for video generation');
+      const vidRes = await fetch('https://api.dev.runwayml.com/v1/image_to_video', {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + RUNWAY_KEY,
+          'X-Runway-Version': '2024-11-06',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: 'gen4_turbo',
+          promptImage: imageUrl,
+          promptText: prompt + ', smooth cinematic camera movement',
+          duration: 5,
+          ratio: '1280:720'
+        })
+      });
+      const vidData = await vidRes.json();
+      if (!vidRes.ok) throw new Error(JSON.stringify(vidData));
+      console.log('Video task:', vidData.id);
+      return res.json({ id: vidData.id, success: true });
+    }
+
+    // Step 1: Generate image with gen4_image (2 credits/sec = cheap)
+    console.log('Generating image for:', prompt.substring(0, 60));
+    const imgRes = await fetch('https://api.dev.runwayml.com/v1/text_to_image', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + RUNWAY_KEY,
+        'X-Runway-Version': '2024-11-06',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gen4_image',
+        promptText: prompt + ', photorealistic, cinematic, 4K, professional photography, solar energy',
+        ratio: '1280:720'
+      })
+    });
+    const imgData = await imgRes.json();
+    if (!imgRes.ok) throw new Error('Image gen failed: ' + JSON.stringify(imgData));
+    
+    // Step 2: Poll for image
+    let imageUrl = null;
+    for (let i = 0; i < 20; i++) {
+      await new Promise(r => setTimeout(r, 3000));
+      const statusRes = await fetch('https://api.dev.runwayml.com/v1/tasks/' + imgData.id, {
+        headers: { 'Authorization': 'Bearer ' + RUNWAY_KEY, 'X-Runway-Version': '2024-11-06' }
+      });
+      const statusData = await statusRes.json();
+      if (statusData.status === 'SUCCEEDED' && statusData.output?.[0]) {
+        imageUrl = statusData.output[0];
+        console.log('Image ready:', imageUrl.substring(0, 60));
+        break;
+      }
+      if (statusData.status === 'FAILED') throw new Error('Image failed');
+    }
+    if (!imageUrl) throw new Error('Image timeout');
+
+    // Step 3: Generate video with gen4_turbo (5 credits/sec = cheap)
+    console.log('Generating video from image...');
+    const vidRes = await fetch('https://api.dev.runwayml.com/v1/image_to_video', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + RUNWAY_KEY,
+        'X-Runway-Version': '2024-11-06',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'gen4_turbo',
+        promptImage: imageUrl,
+        promptText: prompt + ', smooth cinematic camera movement',
         duration: 5,
         ratio: '1280:720'
       })
     });
-    const videoData = await videoResponse.json();
-    console.log('Video response:', JSON.stringify(videoData).substring(0, 200));
-    if (!videoResponse.ok) throw new Error(JSON.stringify(videoData));
-    res.json({ id: videoData.id, success: true });
+    const vidData = await vidRes.json();
+    if (!vidRes.ok) throw new Error(JSON.stringify(vidData));
+    console.log('Video task:', vidData.id);
+    res.json({ id: vidData.id, success: true });
   } catch (e) {
     console.error('Generate error:', e.message);
     res.status(500).json({ error: e.message });
@@ -144,7 +248,7 @@ app.post('/api/runway/stitch', async (req, res) => {
     if (voiceoverText && ELEVENLABS_KEY) {
       try {
         console.log('Getting voice ID...');
-        let voiceId = await getFirstVoice();
+        let voiceId = req.body.voiceId || await getFirstVoice();
         if (!voiceId) voiceId = 'EXAVITQu4vr4xnSDxMaL'; // fallback Sarah voice
         console.log('Using voice ID:', voiceId);
 
@@ -208,7 +312,7 @@ app.post('/api/runway/stitch', async (req, res) => {
     fs.copyFileSync(stitched, withText);
     console.log('Skipping text overlay - using stitched video directly');
 
-        let finalPath = withText;
+    let finalPath = withText;
 
     // Add voiceover
     if (audioFile && fs.existsSync(audioFile)) {
@@ -231,6 +335,18 @@ app.post('/api/runway/stitch', async (req, res) => {
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (e) {}
+  }
+});
+
+app.get('/api/voice/list', async (req, res) => {
+  try {
+    const r = await fetch('https://api.elevenlabs.io/v1/voices', {
+      headers: { 'xi-api-key': ELEVENLABS_KEY }
+    });
+    const data = await r.json();
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -262,7 +378,7 @@ app.post('/api/voice/generate', async (req, res) => {
 });
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v6.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v7.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
