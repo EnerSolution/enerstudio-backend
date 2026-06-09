@@ -203,49 +203,10 @@ app.post('/api/runway/stitch', async (req, res) => {
     const totalDuration = clipFiles.length * 5;
     const withText = path.join(tempDir, 'with_text.mp4');
 
-    try {
-      // Find available font
-      let fontPath = null;
-      const fontPaths = [
-        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
-        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
-        '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf',
-        '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf',
-        '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
-        '/usr/share/fonts/liberation/LiberationSans-Bold.ttf',
-        '/usr/share/fonts/truetype/freefont/FreeSansBold.ttf',
-        '/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf'
-      ];
-      for (const fp of fontPaths) {
-        if (fs.existsSync(fp)) { fontPath = fp; break; }
-      }
-      console.log('Font found:', fontPath);
-
-      if (!fontPath) {
-        // Try to install fonts
-        try { execSync('apt-get install -y fonts-dejavu-core 2>/dev/null || true', { timeout: 30000 }); } catch(e) {}
-        for (const fp of fontPaths) {
-          if (fs.existsSync(fp)) { fontPath = fp; break; }
-        }
-      }
-
-      if (!fontPath) throw new Error('No font found');
-
-      // Use simple text directly in filter - no textfile
-      const safeB = brand.replace(/'/g, '').replace(/:/g, '').substring(0, 30);
-      const safeW = website.replace(/'/g, '').replace(/:/g, '').substring(0, 30);
-
-      const drawtextFilter = [
-        "drawtext=fontfile='" + fontPath + "':fontsize=44:fontcolor=white:x=(w-text_w)/2:y=40:text='" + safeB + "':shadowcolor=black:shadowx=3:shadowy=3",
-        "drawtext=fontfile='" + fontPath + "':fontsize=32:fontcolor=yellow:x=(w-text_w)/2:y=h-70:text='" + safeW + "':shadowcolor=black:shadowx=2:shadowy=2:enable='gte(t," + Math.max(0, totalDuration - 5) + ")'"
-      ].join(',');
-
-      execSync('"' + ffmpegPath + '" -i "' + stitched + '" -vf "' + drawtextFilter + '" -c:v libx264 -preset fast -crf 23 "' + withText + '" -y', { timeout: 180000 });
-      console.log('Text overlays added successfully with font:', fontPath);
-    } catch(textErr) {
-      console.log('Text overlay failed:', textErr.message.substring(0, 300));
-      fs.copyFileSync(stitched, withText);
-    }
+    // Skip text overlay - ffmpeg-static does not support drawtext filter
+    // Text overlay will be added in next version with full FFmpeg build
+    fs.copyFileSync(stitched, withText);
+    console.log('Skipping text overlay - using stitched video directly');
 
         let finalPath = withText;
 
