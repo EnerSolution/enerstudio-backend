@@ -1,9 +1,10 @@
 const express = require('express');
 const cors = require('cors');
-const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { execSync } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,7 +17,11 @@ app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
 app.get('/', (req, res) => {
-  res.json({ status: 'EnerStudio Backend Running', version: '4.0.0' });
+  res.json({ 
+    status: 'EnerStudio Backend Running', 
+    version: '5.0.0',
+    ffmpeg: ffmpegPath ? 'available' : 'missing'
+  });
 });
 
 app.post('/api/claude/generate', async (req, res) => {
@@ -48,10 +53,7 @@ app.post('/api/claude/generate', async (req, res) => {
 app.get('/api/runway/balance', async (req, res) => {
   try {
     const response = await fetch('https://api.dev.runwayml.com/v1/organization', {
-      headers: {
-        'Authorization': 'Bearer ' + RUNWAY_KEY,
-        'X-Runway-Version': '2024-11-06'
-      }
+      headers: { 'Authorization': 'Bearer ' + RUNWAY_KEY, 'X-Runway-Version': '2024-11-06' }
     });
     res.json(await response.json());
   } catch (e) {
@@ -89,10 +91,7 @@ app.post('/api/runway/generate', async (req, res) => {
 app.get('/api/runway/status/:taskId', async (req, res) => {
   try {
     const response = await fetch('https://api.dev.runwayml.com/v1/tasks/' + req.params.taskId, {
-      headers: {
-        'Authorization': 'Bearer ' + RUNWAY_KEY,
-        'X-Runway-Version': '2024-11-06'
-      }
+      headers: { 'Authorization': 'Bearer ' + RUNWAY_KEY, 'X-Runway-Version': '2024-11-06' }
     });
     res.json(await response.json());
   } catch (e) {
@@ -108,20 +107,26 @@ app.post('/api/runway/stitch', async (req, res) => {
       return res.status(400).json({ error: 'No clip URLs provided' });
     }
 
+    console.log('Starting stitch of', clipUrls.length, 'clips. FFmpeg path:', ffmpegPath);
+
+    // Download all clips
     const clipFiles = [];
     for (let i = 0; i < clipUrls.length; i++) {
       const clipPath = path.join(tempDir, 'clip' + i + '.mp4');
+      console.log('Downloading clip', i + 1, 'from', clipUrls[i].substring(0, 50));
       const r = await fetch(clipUrls[i]);
       if (!r.ok) throw new Error('Failed to download clip ' + i + ' status ' + r.status);
       const buf = await r.arrayBuffer();
       fs.writeFileSync(clipPath, Buffer.from(buf));
       clipFiles.push(clipPath);
-      console.log('Downloaded clip', i + 1, 'of', clipUrls.length);
+      console.log('Clip', i + 1, 'downloaded:', buf.byteLength, 'bytes');
     }
 
+    // Generate voiceover with ElevenLabs
     let audioFile = null;
     if (voiceoverText && ELEVENLABS_KEY) {
       try {
+        console.log('Generating voiceover...');
         const vr = await fetch('https://api.elevenlabs.io/v1/text-to-speech/f38a635bee7a4d1f9b0a654a31d050d2', {
           method: 'POST',
           headers: {
@@ -139,29 +144,41 @@ app.post('/api/runway/stitch', async (req, res) => {
           audioFile = path.join(tempDir, 'voice.mp3');
           fs.writeFileSync(audioFile, Buffer.from(await vr.arrayBuffer()));
           console.log('Voiceover generated successfully');
+        } else {
+          console.log('Voiceover failed:', vr.status);
         }
       } catch (e) {
         console.log('Voice error:', e.message);
       }
     }
 
+    // Create concat file list
     const listFile = path.join(tempDir, 'list.txt');
     fs.writeFileSync(listFile, clipFiles.map(function(f) { return "file '" + f + "'"; }).join('\n'));
+    console.log('List file created:', fs.readFileSync(listFile, 'utf8'));
 
+    // Stitch clips with ffmpeg-static
     const stitched = path.join(tempDir, 'stitched.mp4');
-    execSync('ffmpeg -f concat -safe 0 -i "' + listFile + '" -c copy "' + stitched + '" -y', { timeout: 120000 });
-    console.log('Clips stitched successfully');
+    const stitchCmd = '"' + ffmpegPath + '" -f concat -safe 0 -i "' + listFile + '" -c copy "' + stitched + '" -y';
+    console.log('Running stitch command:', stitchCmd);
+    execSync(stitchCmd, { timeout: 120000 });
+    console.log('Stitch complete. Size:', fs.statSync(stitched).size);
 
     let finalPath = stitched;
 
+    // Add voiceover if available
     if (audioFile && fs.existsSync(audioFile)) {
       const withAudio = path.join(tempDir, 'final.mp4');
-      execSync('ffmpeg -i "' + stitched + '" -i "' + audioFile + '" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "' + withAudio + '" -y', { timeout: 120000 });
+      const audioCmd = '"' + ffmpegPath + '" -i "' + stitched + '" -i "' + audioFile + '" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "' + withAudio + '" -y';
+      console.log('Adding audio...');
+      execSync(audioCmd, { timeout: 120000 });
       finalPath = withAudio;
-      console.log('Audio added successfully');
+      console.log('Audio added. Final size:', fs.statSync(withAudio).size);
     }
 
+    // Send final video
     const finalVideo = fs.readFileSync(finalPath);
+    console.log('Sending final video:', finalVideo.length, 'bytes');
     res.set('Content-Type', 'video/mp4');
     res.set('Content-Disposition', 'attachment; filename="enerstudio-video.mp4"');
     res.send(finalVideo);
@@ -201,7 +218,8 @@ app.post('/api/voice/generate', async (req, res) => {
 });
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v4.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v5.0 running on port ' + PORT);
+  console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
   console.log('ELEVENLABS_KEY:', ELEVENLABS_KEY ? 'SET' : 'MISSING');
