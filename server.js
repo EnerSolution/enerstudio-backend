@@ -19,7 +19,7 @@ app.use(express.json({ limit: '50mb' }));
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '7.1.0',
+    version: '7.4.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -110,9 +110,18 @@ app.post('/api/runway/generate', async (req, res) => {
     const { prompt, imageUrl } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
 
-    // If imageUrl provided (pre-generated Runway image), use directly
+    // If imageUrl provided, use directly (handles both URLs and base64)
     if (imageUrl) {
-      console.log('Using provided image URL for video generation');
+      let finalImageUrl = imageUrl;
+
+      // If base64, upload to a temp hosting or convert to data URI
+      if (imageUrl.startsWith('data:')) {
+        console.log('Base64 image detected - uploading to Runway as data URI');
+        // Runway accepts data URIs directly in promptImage
+        finalImageUrl = imageUrl;
+      }
+
+      console.log('Using provided image for video generation');
       const vidRes = await fetch('https://api.dev.runwayml.com/v1/image_to_video', {
         method: 'POST',
         headers: {
@@ -122,7 +131,7 @@ app.post('/api/runway/generate', async (req, res) => {
         },
         body: JSON.stringify({
           model: 'gen4_turbo',
-          promptImage: imageUrl,
+          promptImage: finalImageUrl,
           promptText: prompt + ', smooth cinematic camera movement',
           duration: 5,
           ratio: '1280:720'
@@ -274,6 +283,8 @@ app.post('/api/runway/stitch', async (req, res) => {
               .replace(/Show.*?\n/gi, '')
               .replace(/\n+/g, ' ')
               .replace(/\s+/g, ' ')
+              .replace(/\*\*Word count:.*?\*\*/gi, '')
+              .replace(/Word count:.*?words/gi, '')
               .trim()
               .substring(0, 2000),
             model_id: 'eleven_multilingual_v2',
@@ -339,6 +350,34 @@ app.post('/api/runway/stitch', async (req, res) => {
   }
 });
 
+// ===== HEYGEN: list real avatars from your HeyGen account =====
+app.get('/api/heygen/avatars', async (req, res) => {
+  try {
+    if (!process.env.HEYGEN_API_KEY) {
+      return res.status(400).json({ error: 'HEYGEN_API_KEY not configured', configured: false });
+    }
+    const r = await fetch('https://api.heygen.com/v2/avatars', {
+      headers: { 'X-Api-Key': process.env.HEYGEN_API_KEY, 'Accept': 'application/json' }
+    });
+    const d = await r.json();
+    if (!r.ok) {
+      return res.status(r.status).json({ error: d.message || 'HeyGen API error', configured: true });
+    }
+    // Normalize: return id, name, gender, photo, previewVideo
+    const avatars = ((d.data && d.data.avatars) || []).map(a => ({
+      id: a.avatar_id,
+      name: a.avatar_name,
+      gender: (a.gender || 'unknown').toLowerCase(),
+      photo: a.preview_image_url,
+      previewVideo: a.preview_video_url || null,
+      premium: !!a.premium
+    }));
+    res.json({ configured: true, count: avatars.length, avatars });
+  } catch (e) {
+    res.status(500).json({ error: e.message, configured: false });
+  }
+});
+
 app.get('/api/voice/list', async (req, res) => {
   try {
     const r = await fetch('https://api.elevenlabs.io/v1/voices', {
@@ -379,7 +418,7 @@ app.post('/api/voice/generate', async (req, res) => {
 });
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v7.1 running on port ' + PORT);
+  console.log('EnerStudio Backend v7.3 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
