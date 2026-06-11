@@ -19,7 +19,7 @@ app.use(express.json({ limit: '50mb' }));
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '7.4.0',
+    version: '7.5.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -344,6 +344,110 @@ app.post('/api/runway/stitch', async (req, res) => {
 
   } catch (e) {
     console.error('Stitch error:', e.message);
+    res.status(500).json({ error: e.message });
+  } finally {
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (e) {}
+  }
+});
+
+// ===== WHITEBOARD: build animated whiteboard video from sketch images + voiceover =====
+// Cost: zero video-generation credits — animation is done by FFmpeg on this server.
+app.post('/api/whiteboard/stitch', async (req, res) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enerstudio-wb-'));
+  try {
+    const { imageUrls, voiceoverText, voiceId, secondsPerScene } = req.body;
+    if (!imageUrls || imageUrls.length === 0) {
+      return res.status(400).json({ error: 'No image URLs provided' });
+    }
+    const perScene = Math.max(3, Math.min(10, parseInt(secondsPerScene) || 5));
+    console.log('Whiteboard: building', imageUrls.length, 'scenes x', perScene, 's');
+
+    // 1. Download sketch images
+    const imgFiles = [];
+    for (let i = 0; i < imageUrls.length; i++) {
+      const p = path.join(tempDir, 'img' + i + '.jpg');
+      const r = await fetch(imageUrls[i]);
+      if (!r.ok) throw new Error('Image ' + i + ' download failed: ' + r.status);
+      fs.writeFileSync(p, Buffer.from(await r.arrayBuffer()));
+      imgFiles.push(p);
+    }
+    console.log('Images downloaded');
+
+    // 2. Build each scene clip: white canvas wipes to reveal the sketch (draw-on feel)
+    const transitions = ['wipeleft', 'wipedown', 'circleopen', 'wiperight', 'smoothup', 'circlecrop'];
+    const clipFiles = [];
+    for (let i = 0; i < imgFiles.length; i++) {
+      const clip = path.join(tempDir, 'clip' + i + '.mp4');
+      const tr = transitions[i % transitions.length];
+      const revealDur = Math.min(2.5, perScene - 1);
+      const cmd = '"' + ffmpegPath + '" -y' +
+        ' -f lavfi -i "color=white:s=1280x720:d=' + perScene + ':r=25"' +
+        ' -loop 1 -framerate 25 -t ' + perScene + ' -i "' + imgFiles[i] + '"' +
+        ' -filter_complex "[1:v]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,setsar=1[im];' +
+        '[0:v][im]xfade=transition=' + tr + ':duration=' + revealDur + ':offset=0.4,format=yuv420p[v]"' +
+        ' -map "[v]" -c:v libx264 -preset fast -pix_fmt yuv420p -t ' + perScene + ' "' + clip + '"';
+      execSync(cmd, { timeout: 120000 });
+      clipFiles.push(clip);
+      console.log('Whiteboard scene', i + 1, 'animated (' + tr + ')');
+    }
+
+    // 3. Voiceover via ElevenLabs (same cleaning as cinematic pipeline)
+    let audioFile = null;
+    if (voiceoverText && ELEVENLABS_KEY) {
+      try {
+        let vid = voiceId || await getFirstVoice();
+        if (!vid) vid = 'EXAVITQu4vr4xnSDxMaL';
+        const vr = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + vid, {
+          method: 'POST',
+          headers: { 'xi-api-key': ELEVENLABS_KEY, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
+          body: JSON.stringify({
+            text: voiceoverText
+              .replace(/\[.*?\]/g, '')
+              .replace(/SCENE.*?:\s*/gi, '')
+              .replace(/HOOK.*?:\s*/gi, '')
+              .replace(/PROBLEM.*?:\s*/gi, '')
+              .replace(/SOLUTION.*?:\s*/gi, '')
+              .replace(/PROOF.*?:\s*/gi, '')
+              .replace(/CTA.*?:\s*/gi, '')
+              .replace(/\*\*Word count:.*?\*\*/gi, '')
+              .replace(/Word count:.*?words/gi, '')
+              .replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 2000),
+            model_id: 'eleven_multilingual_v2',
+            voice_settings: { stability: 0.5, similarity_boost: 0.75 }
+          })
+        });
+        if (vr.ok) {
+          audioFile = path.join(tempDir, 'voice.mp3');
+          fs.writeFileSync(audioFile, Buffer.from(await vr.arrayBuffer()));
+          console.log('Whiteboard voiceover generated');
+        } else {
+          console.log('Voiceover failed:', vr.status);
+        }
+      } catch (e) { console.log('Voice error:', e.message); }
+    }
+
+    // 4. Concat scenes
+    const listFile = path.join(tempDir, 'list.txt');
+    fs.writeFileSync(listFile, clipFiles.map(f => "file '" + f + "'").join('\n'));
+    const stitched = path.join(tempDir, 'stitched.mp4');
+    execSync('"' + ffmpegPath + '" -f concat -safe 0 -i "' + listFile + '" -c copy "' + stitched + '" -y', { timeout: 120000 });
+
+    // 5. Mux voiceover, trimmed to video length
+    let finalPath = stitched;
+    if (audioFile && fs.existsSync(audioFile)) {
+      const withAudio = path.join(tempDir, 'final.mp4');
+      const videoDuration = clipFiles.length * perScene;
+      execSync('"' + ffmpegPath + '" -i "' + stitched + '" -i "' + audioFile + '" -map 0:v -map 1:a -c:v copy -c:a aac -t ' + videoDuration + ' "' + withAudio + '" -y', { timeout: 120000 });
+      finalPath = withAudio;
+    }
+
+    const finalVideo = fs.readFileSync(finalPath);
+    console.log('Whiteboard video ready:', finalVideo.length, 'bytes');
+    res.set('Content-Type', 'video/mp4');
+    res.set('Content-Disposition', 'attachment; filename="enerstudio-whiteboard.mp4"');
+    res.send(finalVideo);
+  } catch (e) {
+    console.error('Whiteboard error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (e) {}
