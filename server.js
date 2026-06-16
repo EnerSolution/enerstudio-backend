@@ -30,6 +30,17 @@ setInterval(() => {
   });
 }, 5 * 60 * 1000);
 
+// Latest video endpoint — returns most recently saved videoId (for polling after timeout)
+app.get('/api/video/latest', (req, res) => {
+  const ids = Object.keys(outputStore);
+  if (!ids.length) return res.json({ status: 'processing' });
+  // Return the most recently created one
+  const latest = ids.sort((a,b) => outputStore[b].created - outputStore[a].created)[0];
+  const entry = outputStore[latest];
+  if (!entry) return res.json({ status: 'processing' });
+  res.json({ status: 'ready', videoId: latest, size: entry.size });
+});
+
 // Download endpoint — app fetches this after getting videoId
 app.get('/api/video/:id', (req, res) => {
   const entry = outputStore[req.params.id];
@@ -60,7 +71,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.4.0',
+    version: '8.4.1',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
