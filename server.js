@@ -16,10 +16,51 @@ const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY;
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
 
+// ── VIDEO OUTPUT STORE (bypasses Render 30s timeout) ──────────────────────
+const outputStore = {}; // { videoId: { path, size, created } }
+// Cleanup files older than 30 minutes
+setInterval(() => {
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  Object.keys(outputStore).forEach(id => {
+    if (outputStore[id].created < cutoff) {
+      try { fs.unlinkSync(outputStore[id].path); } catch(e) {}
+      delete outputStore[id];
+      console.log('Cleaned up video:', id);
+    }
+  });
+}, 5 * 60 * 1000);
+
+// Download endpoint — app fetches this after getting videoId
+app.get('/api/video/:id', (req, res) => {
+  const entry = outputStore[req.params.id];
+  if (!entry) return res.status(404).json({ error: 'Video not found or expired' });
+  if (!fs.existsSync(entry.path)) return res.status(404).json({ error: 'Video file missing' });
+  res.set('Content-Type', 'video/mp4');
+  res.set('Content-Disposition', 'attachment; filename="enerstudio-whiteboard.mp4"');
+  res.set('Content-Length', entry.size);
+  const stream = fs.createReadStream(entry.path);
+  stream.pipe(res);
+  // Clean up after download
+  stream.on('end', () => {
+    setTimeout(() => {
+      try { fs.unlinkSync(entry.path); } catch(e) {}
+      delete outputStore[req.params.id];
+    }, 5000);
+  });
+});
+
+// Status check endpoint — app polls this while video is processing
+app.get('/api/video/:id/status', (req, res) => {
+  const entry = outputStore[req.params.id];
+  if (!entry) return res.json({ status: 'processing' });
+  res.json({ status: 'ready', size: entry.size });
+});
+
+
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.3.0',
+    version: '8.4.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -336,11 +377,13 @@ app.post('/api/runway/stitch', async (req, res) => {
       console.log('No audio file available - sending video without voiceover');
     }
 
-    const finalVideo = fs.readFileSync(finalPath);
-    console.log('Sending final video:', finalVideo.length, 'bytes');
-    res.set('Content-Type', 'video/mp4');
-    res.set('Content-Disposition', 'attachment; filename="enerstudio-video.mp4"');
-    res.send(finalVideo);
+    const videoId = 'cin_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+    const outputPath = path.join(os.tmpdir(), videoId + '.mp4');
+    fs.copyFileSync(finalPath, outputPath);
+    const fileSize = fs.statSync(outputPath).size;
+    outputStore[videoId] = { path: outputPath, size: fileSize, created: Date.now() };
+    console.log('Cinematic ready:', fileSize, 'bytes, id:', videoId);
+    res.json({ videoId, downloadUrl: '/api/video/' + videoId, size: fileSize });
 
   } catch (e) {
     console.error('Stitch error:', e.message);
@@ -350,7 +393,7 @@ app.post('/api/runway/stitch', async (req, res) => {
   }
 });
 
-// ===== WHITEBOARD v8.3.0: RASTER REVEAL + FFmpeg FALLBACK =====
+// ===== WHITEBOARD v8.4.0: RASTER REVEAL + FFmpeg FALLBACK =====
 // Primary: Python pixel-by-pixel reveal (professional hand-draws strokes progressively)
 // Fallback: FFmpeg wipe reveal (if Python packages not yet installed)
 // Python packages auto-installed at server startup
@@ -365,7 +408,7 @@ app.post('/api/whiteboard/animate', async (req, res) => {
       return res.status(400).json({ error: 'No image URLs provided' });
     }
     const perScene = Math.max(6, Math.min(12, parseInt(secondsPerScene) || 8));
-    console.log('Whiteboard v8.3.0: ' + imageUrls.length + ' scenes, pythonReady=' + pythonReady);
+    console.log('Whiteboard v8.4.0: ' + imageUrls.length + ' scenes, pythonReady=' + pythonReady);
 
     // Write hand PNG
     const handPath = path.join(tempDir, 'hand.png');
@@ -521,12 +564,16 @@ print(f'done:{total_frames}')
       execSync('"' + ffmpegPath + '" -i "' + stitched + '" -i "' + audioFile + '" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "' + withAudio + '" -y', { timeout: 120000 });
       finalPath = withAudio;
     }
-    const out = fs.readFileSync(finalPath);
-    console.log('Whiteboard v8.3.0 ready:', out.length, 'bytes, pythonReady=' + pythonReady);
-    res.set('Content-Type','video/mp4'); res.set('Content-Disposition','attachment; filename="enerstudio-whiteboard.mp4"'); res.send(out);
+    const videoId = 'wb_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+    const outputPath = path.join(os.tmpdir(), videoId + '.mp4');
+    fs.copyFileSync(finalPath, outputPath);
+    const fileSize = fs.statSync(outputPath).size;
+    outputStore[videoId] = { path: outputPath, size: fileSize, created: Date.now() };
+    console.log('Whiteboard v8.4.0 ready:', fileSize, 'bytes, id:', videoId, 'pythonReady=' + pythonReady);
+    res.json({ videoId, downloadUrl: '/api/video/' + videoId, size: fileSize, scenes: imageUrls.length });
 
   } catch(e) {
-    console.error('Whiteboard v8.3.0 error:', e.message);
+    console.error('Whiteboard v8.4.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir, {recursive:true,force:true}); } catch(e) {}
