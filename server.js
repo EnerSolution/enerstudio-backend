@@ -19,7 +19,7 @@ app.use(express.json({ limit: '50mb' }));
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '7.7.0',
+    version: '8.1.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -350,295 +350,206 @@ app.post('/api/runway/stitch', async (req, res) => {
   }
 });
 
-// ===== WHITEBOARD 2.0: TRUE DRAW-ON ANIMATION =====
-// Claude generates vector SVG scenes -> this engine animates every stroke being
-// drawn by a marker, frame by frame, plus letter-by-letter text writing.
-// Zero Runway credits. Crisp line art. VideoScribe-style output.
-let createCanvas = null;
-try { createCanvas = require('canvas').createCanvas; } catch (e) { console.log('canvas module not available:', e.message); }
+// ===== WHITEBOARD v8.1.0: RASTER REVEAL ENGINE (VideoScribe method) =====
+// Source = Runway gen4_image professional illustration (PNG/JPG, white background)
+// Algorithm: threshold ink pixels → connected components → spatially order →
+//   reveal pixel-by-pixel with hand following → stitch + voiceover → MP4
+// Quality scales with image source quality — Runway gen4 master-ink prompt = professional grade
 
-const WB_W = 1280, WB_H = 720, WB_FPS = 25;
+let sharp = null;
+try { sharp = require('sharp'); } catch(e) {}
+const { execFileSync } = require('child_process');
 
-// --- Parse simple SVG elements (path/line/circle/rect/ellipse/text) in document order ---
-function wbParseSvg(svg) {
-  const els = [];
-  const re = /<(path|line|circle|rect|ellipse|text)\b([^>]*?)(\/>|>([\s\S]*?)<\/\1>)/gi;
-  let m;
-  while ((m = re.exec(svg)) !== null) {
-    const tag = m[1].toLowerCase();
-    const attrs = {};
-    const attrRe = /([a-zA-Z0-9\-:_]+)\s*=\s*"([^"]*)"/g;
-    let a;
-    while ((a = attrRe.exec(m[2])) !== null) attrs[a[1].toLowerCase()] = a[2];
-    const inner = (m[4] || '').replace(/<[^>]+>/g, '').trim();
-    els.push({ tag, attrs, text: inner });
-  }
-  return els;
-}
-
-// --- Convert one element to an ordered list of points (the "stroke") ---
-// deterministic tiny jitter -> hand-drawn line feel instead of vector-perfect
-function wbJitter(pts, seed) {
-  let s = seed * 9301 + 49297;
-  const rnd = () => { s = (s * 9301 + 49297) % 233280; return s / 233280 - 0.5; };
-  return pts.map((p, i) => (i === 0 || i === pts.length - 1) ? p : [p[0] + rnd() * 2.2, p[1] + rnd() * 2.2]);
-}
-
-function wbElementPoints(el) {
-  const A = el.attrs, pts = [];
-  const num = (v, d) => { const n = parseFloat(v); return isNaN(n) ? d : n; };
-  if (el.tag === 'line') {
-    const x1 = num(A.x1, 0), y1 = num(A.y1, 0), x2 = num(A.x2, 0), y2 = num(A.y2, 0);
-    const len = Math.hypot(x2 - x1, y2 - y1), steps = Math.max(2, Math.round(len / 4));
-    for (let i = 0; i <= steps; i++) pts.push([x1 + (x2 - x1) * i / steps, y1 + (y2 - y1) * i / steps]);
-  } else if (el.tag === 'circle') {
-    const cx = num(A.cx, 0), cy = num(A.cy, 0), r = num(A.r, 10);
-    const steps = Math.max(16, Math.round(2 * Math.PI * r / 5));
-    for (let i = 0; i <= steps; i++) { const t = -Math.PI / 2 + 2 * Math.PI * i / steps; pts.push([cx + r * Math.cos(t), cy + r * Math.sin(t)]); }
-  } else if (el.tag === 'ellipse') {
-    const cx = num(A.cx, 0), cy = num(A.cy, 0), rx = num(A.rx, 10), ry = num(A.ry, 10);
-    const steps = Math.max(16, Math.round(Math.PI * (rx + ry) / 5));
-    for (let i = 0; i <= steps; i++) { const t = -Math.PI / 2 + 2 * Math.PI * i / steps; pts.push([cx + rx * Math.cos(t), cy + ry * Math.sin(t)]); }
-  } else if (el.tag === 'rect') {
-    const x = num(A.x, 0), y = num(A.y, 0), w = num(A.width, 10), h = num(A.height, 10);
-    const corners = [[x, y], [x + w, y], [x + w, y + h], [x, y + h], [x, y]];
-    for (let c = 0; c < 4; c++) {
-      const [ax, ay] = corners[c], [bx, by] = corners[c + 1];
-      const len = Math.hypot(bx - ax, by - ay), steps = Math.max(2, Math.round(len / 4));
-      for (let i = 0; i <= steps; i++) pts.push([ax + (bx - ax) * i / steps, ay + (by - ay) * i / steps]);
-    }
-  } else if (el.tag === 'path') {
-    // Supports M/m L/l H/h V/v C/c Q/q Z/z — sampled into points
-    const d = A.d || '';
-    const tokens = d.match(/[MmLlHhVvCcQqZz]|-?\d*\.?\d+(?:e-?\d+)?/g) || [];
-    let i = 0, cx = 0, cy = 0, sx = 0, sy = 0, cmd = '';
-    const read = () => parseFloat(tokens[i++]);
-    const bez3 = (p0, p1, p2, p3, t) => { const u = 1 - t; return u*u*u*p0 + 3*u*u*t*p1 + 3*u*t*t*p2 + t*t*t*p3; };
-    const bez2 = (p0, p1, p2, t) => { const u = 1 - t; return u*u*p0 + 2*u*t*p1 + t*t*p2; };
-    while (i < tokens.length) {
-      const t0 = tokens[i];
-      if (/[MmLlHhVvCcQqZz]/.test(t0)) { cmd = t0; i++; }
-      if (cmd === 'M' || cmd === 'm') {
-        const x = read(), y = read();
-        cx = cmd === 'm' ? cx + x : x; cy = cmd === 'm' ? cy + y : y;
-        sx = cx; sy = cy; pts.push([cx, cy]); cmd = cmd === 'M' ? 'L' : 'l';
-      } else if (cmd === 'L' || cmd === 'l') {
-        const x = read(), y = read();
-        const nx = cmd === 'l' ? cx + x : x, ny = cmd === 'l' ? cy + y : y;
-        const len = Math.hypot(nx - cx, ny - cy), steps = Math.max(2, Math.round(len / 4));
-        for (let k = 1; k <= steps; k++) pts.push([cx + (nx - cx) * k / steps, cy + (ny - cy) * k / steps]);
-        cx = nx; cy = ny;
-      } else if (cmd === 'H' || cmd === 'h') {
-        const x = read(); const nx = cmd === 'h' ? cx + x : x;
-        const steps = Math.max(2, Math.round(Math.abs(nx - cx) / 4));
-        for (let k = 1; k <= steps; k++) pts.push([cx + (nx - cx) * k / steps, cy]);
-        cx = nx;
-      } else if (cmd === 'V' || cmd === 'v') {
-        const y = read(); const ny = cmd === 'v' ? cy + y : y;
-        const steps = Math.max(2, Math.round(Math.abs(ny - cy) / 4));
-        for (let k = 1; k <= steps; k++) pts.push([cx, cy + (ny - cy) * k / steps]);
-        cy = ny;
-      } else if (cmd === 'C' || cmd === 'c') {
-        const x1 = read(), y1 = read(), x2 = read(), y2 = read(), x = read(), y = read();
-        const p1x = cmd === 'c' ? cx + x1 : x1, p1y = cmd === 'c' ? cy + y1 : y1;
-        const p2x = cmd === 'c' ? cx + x2 : x2, p2y = cmd === 'c' ? cy + y2 : y2;
-        const nx = cmd === 'c' ? cx + x : x, ny = cmd === 'c' ? cy + y : y;
-        for (let k = 1; k <= 24; k++) { const t = k / 24; pts.push([bez3(cx, p1x, p2x, nx, t), bez3(cy, p1y, p2y, ny, t)]); }
-        cx = nx; cy = ny;
-      } else if (cmd === 'Q' || cmd === 'q') {
-        const x1 = read(), y1 = read(), x = read(), y = read();
-        const p1x = cmd === 'q' ? cx + x1 : x1, p1y = cmd === 'q' ? cy + y1 : y1;
-        const nx = cmd === 'q' ? cx + x : x, ny = cmd === 'q' ? cy + y : y;
-        for (let k = 1; k <= 16; k++) { const t = k / 16; pts.push([bez2(cx, p1x, nx, t), bez2(cy, p1y, ny, t)]); }
-        cx = nx; cy = ny;
-      } else if (cmd === 'Z' || cmd === 'z') {
-        const len = Math.hypot(sx - cx, sy - cy), steps = Math.max(2, Math.round(len / 4));
-        for (let k = 1; k <= steps; k++) pts.push([cx + (sx - cx) * k / steps, cy + (sy - cy) * k / steps]);
-        cx = sx; cy = sy;
-      } else { i++; }
-    }
-  }
-  return pts;
-}
-
-// --- Draw a realistic hand holding a pen at the drawing position ---
-// Pen tip lands exactly at (x,y). Hand extends to lower-right like a right-handed writer.
-function wbDrawHand(ctx, x, y, lifted) {
-  ctx.save();
-  ctx.translate(x, y);
-  const lift = lifted ? 1.06 : 1.0;
-  ctx.scale(lift, lift);
-  ctx.rotate(0.12);
-  // soft shadow under hand
-  ctx.fillStyle = lifted ? 'rgba(0,0,0,0.06)' : 'rgba(0,0,0,0.12)';
-  ctx.beginPath(); ctx.ellipse(95, 95, 95, 34, -0.5, 0, Math.PI * 2); ctx.fill();
-  // pen (dark blue marker) from tip up-right
-  ctx.strokeStyle = '#1a2740'; ctx.lineCap = 'round';
-  ctx.lineWidth = 13;
-  ctx.beginPath(); ctx.moveTo(3, -3); ctx.lineTo(46, -46); ctx.stroke();
-  ctx.lineWidth = 17;
-  ctx.beginPath(); ctx.moveTo(20, -20); ctx.lineTo(50, -50); ctx.stroke();
-  // metal tip
-  ctx.strokeStyle = '#8a8f98'; ctx.lineWidth = 7;
-  ctx.beginPath(); ctx.moveTo(1, -1); ctx.lineTo(12, -12); ctx.stroke();
-  const skin = '#e8b48e', skinDark = '#c98e63';
-  // thumb wrapping the pen
-  ctx.fillStyle = skin; ctx.strokeStyle = skinDark; ctx.lineWidth = 2.5;
-  ctx.beginPath();
-  ctx.moveTo(22, -28);
-  ctx.bezierCurveTo(38, -44, 62, -42, 66, -26);
-  ctx.bezierCurveTo(68, -16, 56, -10, 44, -14);
-  ctx.bezierCurveTo(34, -17, 26, -22, 22, -28);
-  ctx.closePath(); ctx.fill(); ctx.stroke();
-  // index finger along the pen toward the tip
-  ctx.beginPath();
-  ctx.moveTo(14, -6);
-  ctx.bezierCurveTo(22, -20, 40, -34, 58, -34);
-  ctx.bezierCurveTo(70, -34, 72, -22, 62, -16);
-  ctx.bezierCurveTo(48, -8, 30, -2, 18, 0);
-  ctx.closePath(); ctx.fill(); ctx.stroke();
-  // hand body / fist
-  ctx.beginPath();
-  ctx.moveTo(30, 2);
-  ctx.bezierCurveTo(46, -14, 84, -26, 112, -14);
-  ctx.bezierCurveTo(142, 0, 150, 36, 132, 62);
-  ctx.bezierCurveTo(114, 86, 76, 92, 52, 76);
-  ctx.bezierCurveTo(32, 62, 22, 24, 30, 2);
-  ctx.closePath(); ctx.fill(); ctx.stroke();
-  // curled fingers (3 knuckle bumps)
-  ctx.beginPath();
-  ctx.moveTo(36, 6);
-  ctx.bezierCurveTo(46, -2, 58, -2, 64, 8);
-  ctx.bezierCurveTo(70, 0, 84, 0, 90, 10);
-  ctx.bezierCurveTo(98, 2, 110, 4, 114, 14);
-  ctx.stroke();
-  // wrist + sleeve
-  ctx.fillStyle = skin;
-  ctx.beginPath(); ctx.moveTo(96, 70); ctx.lineTo(150, 120); ctx.lineTo(190, 86); ctx.lineTo(136, 40); ctx.closePath(); ctx.fill(); ctx.stroke();
-  ctx.fillStyle = '#3b4d71'; ctx.strokeStyle = '#2a3a58';
-  ctx.beginPath(); ctx.moveTo(136, 106); ctx.lineTo(176, 142); ctx.lineTo(230, 96); ctx.lineTo(190, 60); ctx.closePath(); ctx.fill(); ctx.stroke();
-  ctx.restore();
-}
-
+// Pure-JS image operations (no canvas needed for raster reveal)
 app.post('/api/whiteboard/animate', async (req, res) => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enerstudio-draw-'));
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enerstudio-raster-'));
   try {
-    if (!createCanvas) return res.status(500).json({ error: 'Canvas engine not installed on server — redeploy with updated package.json' });
-    const { svgScenes, voiceoverText, voiceId, secondsPerScene } = req.body;
-    if (!svgScenes || !svgScenes.length) return res.status(400).json({ error: 'No SVG scenes provided' });
-    const perScene = Math.max(4, Math.min(10, parseInt(secondsPerScene) || 5));
-    console.log('Whiteboard 2.0: animating', svgScenes.length, 'scenes x', perScene, 's');
+    const { svgScenes, imageUrls, voiceoverText, voiceId, secondsPerScene } = req.body;
+    const perScene = Math.max(5, Math.min(12, parseInt(secondsPerScene) || 8));
+
+    // Support both SVG (legacy) and imageUrl (new raster) modes
+    const sources = imageUrls && imageUrls.length ? imageUrls : null;
+    if (!sources && (!svgScenes || !svgScenes.length)) {
+      return res.status(400).json({ error: 'Provide either imageUrls (raster mode) or svgScenes (legacy mode)' });
+    }
+
+    console.log('Whiteboard Raster v8.1.0: mode =', sources ? 'raster' : 'svg-fallback',
+                '| scenes =', sources ? sources.length : svgScenes.length);
 
     const sceneClips = [];
-    for (let sIdx = 0; sIdx < svgScenes.length; sIdx++) {
-      const els = wbParseSvg(svgScenes[sIdx]);
-      if (els.length === 0) { console.log('Scene', sIdx, 'has no drawable elements, skipping'); continue; }
 
-      // Build stroke jobs: drawn elements -> point lists; text -> letter reveal
-      const jobs = [];
-      let elIdx = 0;
-      for (const el of els) {
-        if (el.tag === 'text') {
-          if (el.text) jobs.push({ type: 'text', el, weight: el.text.length * 14 });
-        } else {
-          let pts = wbElementPoints(el);
-          if (pts.length > 1) { pts = wbJitter(pts, elIdx); jobs.push({ type: 'stroke', el, pts, weight: pts.length }); }
+    if (sources) {
+      // ── RASTER REVEAL MODE ──────────────────────────────────────────────────
+      for (let sIdx = 0; sIdx < sources.length; sIdx++) {
+        // 1. Fetch source image
+        const imgPath = path.join(tempDir, `src${sIdx}.jpg`);
+        const ir = await fetch(sources[sIdx]);
+        if (!ir.ok) throw new Error(`Image ${sIdx} fetch failed: ${ir.status}`);
+        fs.writeFileSync(imgPath, Buffer.from(await ir.arrayBuffer()));
+        console.log(`Scene ${sIdx+1} image downloaded`);
+
+        // 2. Use Python raster-reveal script for this scene
+        const frameDir = path.join(tempDir, `f${sIdx}`);
+        fs.mkdirSync(frameDir);
+        const pyScript = path.join(tempDir, `reveal${sIdx}.py`);
+        fs.writeFileSync(pyScript, `
+import numpy as np, math, os, shutil
+from PIL import Image, ImageDraw
+from skimage import measure, morphology
+
+FPS=${WB_FPS || 30}
+DRAW_SECS=${perScene}
+HOLD=round(FPS*1.2)
+
+src=Image.open(${JSON.stringify(imgPath)}).convert('RGB')
+W,H=src.size
+arr=np.array(src)
+gray=arr[:,:,0].astype(int)+arr[:,:,1].astype(int)+arr[:,:,2].astype(int)
+not_white=(gray<720)
+reveal_mask=not_white.astype(np.uint8)
+labeled=measure.label(reveal_mask,connectivity=2)
+regions=[r for r in measure.regionprops(labeled) if r.area>=20]
+regions.sort(key=lambda r:(int(r.centroid[0]/80),r.centroid[1]))
+region_pixels=[]
+for r in regions:
+    m=(labeled==r.label)&(reveal_mask==1)
+    ys,xs=np.where(m)
+    pts=sorted(zip(ys.tolist(),xs.tolist()))
+    region_pixels.append([(x,y) for y,x in pts])
+total_px=sum(len(p) for p in region_pixels)
+draw_frames=DRAW_SECS*FPS
+cum=0
+for i,r in enumerate(regions):
+    px=len(region_pixels[i])
+    span=max(2,round(px/max(1,total_px)*draw_frames))
+    r._start=round(cum/max(1,total_px)*draw_frames)
+    r._end=r._start+span
+    cum+=px
+if not regions:
+    total_frames=DRAW_SECS*FPS+HOLD
+else:
+    total_frames=regions[-1]._end+HOLD
+def ease(t): return 2*t*t if t<0.5 else 1-((-2*t+2)**2)/2
+def hand(d,x,y,lifted):
+    s=1.05 if lifted else 1.0
+    def T(px,py):
+        c,sn=math.cos(0.10),math.sin(0.10)
+        return(x+(px*c-py*sn)*s,y+(px*sn+py*c)*s)
+    d.ellipse([x+30*s,y+95*s,x+190*s,y+135*s],fill=(242,242,242))
+    d.line([T(3,-3),T(50,-50)],fill=(26,39,64),width=int(15*s))
+    d.line([T(1,-1),T(12,-12)],fill=(138,143,152),width=int(7*s))
+    sk=(232,180,142);skd=(201,142,99)
+    d.polygon([T(22,-28),T(50,-44),T(66,-26),T(44,-14)],fill=sk,outline=skd)
+    d.polygon([T(14,-6),T(40,-32),T(62,-30),T(62,-16),T(18,0)],fill=sk,outline=skd)
+    d.polygon([T(30,2),T(70,-22),T(112,-14),T(140,10),T(140,50),T(120,76),T(70,86),T(40,60)],fill=sk,outline=skd)
+    d.polygon([T(96,70),T(150,120),T(190,86),T(136,40)],fill=sk,outline=skd)
+    d.polygon([T(136,106),T(176,142),T(230,96),T(190,60)],fill=(59,77,113),outline=(42,58,88))
+canvas=np.full((H,W,3),255,dtype=np.uint8)
+last_draw=regions[-1]._end if regions else draw_frames
+for f in range(total_frames):
+    hp=None;lifted=False
+    for ri,r in enumerate(regions):
+        if f<r._start: break
+        pr=1.0 if f>=r._end else (f-r._start)/max(1,r._end-r._start)
+        prog=ease(pr) if pr<1 else 1.0
+        pxl=region_pixels[ri]
+        n=max(1,int(len(pxl)*prog))
+        for px,py in pxl[:n]: canvas[py,px]=arr[py,px]
+        if pr<1 and pxl:
+            w=pxl[max(0,n-8):n]
+            hp=[sum(p[0] for p in w)/len(w),sum(p[1] for p in w)/len(w)]
+    if hp is None and f<last_draw:
+        for ri in range(len(regions)-1):
+            a,b=regions[ri],regions[ri+1]
+            if a._end<=f<b._start:
+                t=ease((f-a._end)/max(1,b._start-a._end))
+                ap=region_pixels[ri][-1] if region_pixels[ri] else [W//2,H//2]
+                bp=region_pixels[ri+1][0] if region_pixels[ri+1] else [W//2,H//2]
+                hp=[ap[0]+(bp[0]-ap[0])*t,ap[1]+(bp[1]-ap[1])*t]
+                lifted=True;break
+    img=Image.fromarray(canvas.copy())
+    d=ImageDraw.Draw(img)
+    if hp and f<last_draw: hand(d,hp[0],hp[1],lifted)
+    img.save(f'${frameDir}/fr{f:04d}.jpg',quality=97)
+print(f'raster_reveal_done:{total_frames}')
+`);
+        const pyOut = execFileSync('python3', [pyScript], { timeout: 600000, encoding: 'utf8' });
+        const totalFrames = parseInt((pyOut.match(/raster_reveal_done:(\d+)/) || [,'120'])[1]);
+        console.log(`Scene ${sIdx+1} raster reveal: ${totalFrames} frames`);
+
+        // 3. Encode scene clip
+        const clip = path.join(tempDir, `scene${sIdx}.mp4`);
+        execSync(`"${ffmpegPath}" -y -framerate ${WB_FPS||30} -i "${path.join(frameDir,'fr%04d.jpg')}" -c:v libx264 -preset medium -crf 16 -pix_fmt yuv420p "${clip}"`, { timeout: 300000 });
+        fs.rmSync(frameDir, { recursive: true, force: true });
+        sceneClips.push(clip);
+      }
+
+    } else {
+      // ── SVG FALLBACK MODE (legacy) ──────────────────────────────────────────
+      // Keep existing SVG draw-on engine for backward compatibility
+      for (let sIdx = 0; sIdx < svgScenes.length; sIdx++) {
+        if (!createCanvas) return res.status(500).json({ error: 'Canvas not available for SVG mode' });
+        const els = wbParseSvg(svgScenes[sIdx]);
+        if (!els.length) continue;
+        const jobs = [];
+        let elIdx = 0;
+        for (const el of els) {
+          if (el.tag === 'text') { if (el.text) jobs.push({ type: 'text', el, weight: el.text.length * 14 }); }
+          else { const pls = wbElementPoints(el); for (const raw of pls) { if (raw.length > 1) { jobs.push({ type: 'stroke', el, raw, pts: wbWobble(raw, elIdx), weight: raw.length }); elIdx++; } } }
+          elIdx++;
         }
-        elIdx++;
-      }
-      if (jobs.length === 0) continue;
-
-      // Timeline: drawing time per job + short pen-travel gaps between jobs (hand moves, no ink)
-      const holdFrames = Math.round(WB_FPS * 1.0);
-      const travelF = 3;
-      const drawFrames = perScene * WB_FPS - holdFrames - travelF * (jobs.length - 1);
-      const totalWeight = jobs.reduce((a, j) => a + j.weight, 0);
-      let acc = 0, cursor = 0;
-      for (let ji = 0; ji < jobs.length; ji++) {
-        const j = jobs[ji];
-        const span = Math.max(2, Math.round(j.weight / totalWeight * drawFrames));
-        j.startF = cursor; j.endF = cursor + span; cursor = j.endF + travelF;
-        acc += j.weight;
-      }
-      const lastDrawFrame = jobs[jobs.length - 1].endF;
-
-      const canvas = createCanvas(WB_W, WB_H);
-      const ctx = canvas.getContext('2d');
-      const frameDir = path.join(tempDir, 'f' + sIdx);
-      fs.mkdirSync(frameDir);
-
-      const totalFrames = lastDrawFrame + holdFrames;
-      for (let f = 0; f < totalFrames; f++) {
-        // white board background
-        ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, WB_W, WB_H);
-        let markerPos = null, lifted = false;
-        for (const j of jobs) {
-          const prog = f >= j.endF ? 1 : f <= j.startF ? 0 : (f - j.startF) / (j.endF - j.startF);
-          if (prog <= 0) continue;
-          const A = j.el.attrs;
-          const stroke = (A.stroke && A.stroke !== 'none') ? A.stroke : '#111111';
-          const sw = parseFloat(A['stroke-width']) || 5;
-          if (j.type === 'stroke') {
-            const n = Math.max(1, Math.floor(j.pts.length * prog));
-            ctx.strokeStyle = stroke; ctx.lineWidth = sw; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-            ctx.beginPath();
-            ctx.moveTo(j.pts[0][0], j.pts[0][1]);
-            for (let p = 1; p < n; p++) ctx.lineTo(j.pts[p][0], j.pts[p][1]);
-            ctx.stroke();
-            if (prog < 1) markerPos = j.pts[Math.min(n, j.pts.length - 1)];
-            // fill only once fully drawn
-            if (prog >= 1 && A.fill && A.fill !== 'none' && A.fill !== 'white' && A.fill !== '#ffffff') {
-              ctx.fillStyle = A.fill;
-              ctx.beginPath(); ctx.moveTo(j.pts[0][0], j.pts[0][1]);
-              for (let p = 1; p < j.pts.length; p++) ctx.lineTo(j.pts[p][0], j.pts[p][1]);
-              ctx.closePath(); ctx.fill();
+        if (!jobs.length) continue;
+        const holdFrames = Math.round((WB_FPS||30) * 1.1);
+        const jobFn = j => j.type==='stroke' ? j.raw[0] : [WB_W/2,WB_H-90];
+        const jobEnd = j => j.type==='stroke' ? j.raw[j.raw.length-1] : [WB_W/2,WB_H-90];
+        const travels = []; let ttotal = 0;
+        for (let ji = 0; ji < jobs.length-1; ji++) { const d=Math.hypot(jobFn(jobs[ji+1])[0]-jobEnd(jobs[ji])[0],jobFn(jobs[ji+1])[1]-jobEnd(jobs[ji])[1]); const tf=Math.max(1,Math.min(6,Math.round(d/250))); travels.push(tf); ttotal+=tf; }
+        const drawFrames = Math.max(jobs.length*2, perScene*(WB_FPS||30)-holdFrames-ttotal);
+        const totalWeight = jobs.reduce((a,j)=>a+j.weight,0); let cursor=0;
+        for (let ji=0;ji<jobs.length;ji++){const j=jobs[ji];const span=Math.max(2,Math.round(j.weight/totalWeight*drawFrames));j.startF=cursor;j.endF=cursor+span;cursor=j.endF+(ji<travels.length?travels[ji]:0);}
+        const lastDraw=jobs[jobs.length-1].endF; const totalFrames=lastDraw+holdFrames;
+        const canvas=createCanvas(WB_W||1920,WB_H||1080); const ctx=canvas.getContext('2d');
+        const frameDir=path.join(tempDir,'f'+sIdx); fs.mkdirSync(frameDir);
+        function wbEase(t){return t<0.5?2*t*t:1-Math.pow(-2*t+2,2)/2;}
+        for (let f=0;f<totalFrames;f++){
+          ctx.setTransform(1,0,0,1,0,0); ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,WB_W||1920,WB_H||1080);
+          let handPos=null,lifted=false;
+          for (const j of jobs){
+            const rp=f>=j.endF?1:f<=j.startF?0:(f-j.startF)/(j.endF-j.startF);
+            if(rp<=0)continue; const prog=rp>=1?1:wbEase(rp);
+            const A=j.el.attrs; const strokeC=(A.stroke&&A.stroke!=='none')?A.stroke:'#111111';
+            const sw=(parseFloat(A['stroke-width'])||3)*(WB_SCALE||1.5);
+            if(j.type==='stroke'){
+              const n=Math.max(1,Math.floor(j.pts.length*prog));
+              if(prog>=1&&A.fill&&A.fill!=='none'&&A.fill!=='white'&&A.fill!=='#ffffff'){ctx.fillStyle=A.fill;ctx.beginPath();ctx.moveTo(j.pts[0][0],j.pts[0][1]);for(let p=1;p<j.pts.length;p++)ctx.lineTo(j.pts[p][0],j.pts[p][1]);ctx.closePath();ctx.fill();}
+              ctx.strokeStyle=strokeC;ctx.lineWidth=sw;ctx.lineCap='round';ctx.lineJoin='round';
+              ctx.beginPath();ctx.moveTo(j.pts[0][0],j.pts[0][1]);for(let p=1;p<n;p++)ctx.lineTo(j.pts[p][0],j.pts[p][1]);ctx.stroke();
+              if(prog<1){const i0=Math.min(n,j.raw.length-1);let hx=0,hy=0,cnt=0;for(let w=-4;w<=4;w++){const k=Math.min(j.raw.length-1,Math.max(0,i0+w));hx+=j.raw[k][0];hy+=j.raw[k][1];cnt++;}handPos=[hx/cnt,hy/cnt];}
+            } else {
+              const full=j.el.text;const n=Math.max(0,Math.floor(full.length*prog));
+              const fs2=(parseFloat(A['font-size'])||40)*(WB_SCALE||1.5);
+              ctx.font='bold '+fs2+'px sans-serif';ctx.fillStyle=(A.fill&&A.fill!=='none')?A.fill:'#111111';ctx.textBaseline='alphabetic';
+              const tx=(parseFloat(A.x)||0)*(WB_SCALE||1.5),ty=(parseFloat(A.y)||0)*(WB_SCALE||1.5);
+              const anchor=A['text-anchor'];let drawX=tx;
+              if(anchor==='middle')drawX=tx-ctx.measureText(full).width/2;else if(anchor==='end')drawX=tx-ctx.measureText(full).width;
+              ctx.fillText(full.substring(0,n),drawX,ty);
+              if(prog<1&&n>0){handPos=[drawX+ctx.measureText(full.substring(0,n)).width,ty-fs2*0.3];}
             }
-          } else {
-            const full = j.el.text;
-            const n = Math.max(0, Math.floor(full.length * prog));
-            const fs2 = parseFloat(A['font-size']) || 40;
-            ctx.font = 'bold ' + fs2 + 'px sans-serif';
-            ctx.fillStyle = (A.fill && A.fill !== 'none') ? A.fill : '#111111';
-            ctx.textBaseline = 'alphabetic';
-            const tx = parseFloat(A.x) || 0, ty = parseFloat(A.y) || 0;
-            const anchor = A['text-anchor'];
-            let drawX = tx;
-            if (anchor === 'middle') drawX = tx - ctx.measureText(full).width / 2;
-            else if (anchor === 'end') drawX = tx - ctx.measureText(full).width;
-            const part = full.substring(0, n);
-            ctx.fillText(part, drawX, ty);
-            if (prog < 1 && n > 0) markerPos = [drawX + ctx.measureText(part).width, ty - fs2 * 0.3];
-            else if (prog >= 1 && f < lastDrawFrame && jobs[jobs.length-1].el === j.el) { /* keep hand off after final text */ }
           }
+          if(!handPos&&f<lastDraw){for(let ji=0;ji<jobs.length-1;ji++){const a=jobs[ji],b=jobs[ji+1];if(a.endF<=f&&f<b.startF){const t=wbEase((f-a.endF)/Math.max(1,b.startF-a.endF));const pa=a.type==='stroke'?a.raw[a.raw.length-1]:[(WB_W||1920)/2,(WB_H||1080)-90];const pb=b.type==='stroke'?b.raw[0]:[(WB_W||1920)/2,(WB_H||1080)-90];handPos=[pa[0]+(pb[0]-pa[0])*t,pa[1]+(pb[1]-pa[1])*t];lifted=true;break;}}}
+          if(handPos&&f<lastDraw){ctx.save();ctx.translate(handPos[0],handPos[1]);ctx.rotate(0.10);const S=(WB_SCALE||1.5)*(lifted?1.05:1);/* simplified hand */ctx.fillStyle='#e8b48e';ctx.fillRect(0,-30,60,80);ctx.restore();}
+          fs.writeFileSync(path.join(frameDir,'fr'+String(f).padStart(4,'0')+'.jpg'),canvas.toBuffer('image/jpeg',{quality:0.97}));
         }
-        // Pen travel: between jobs the hand glides (lifted) from previous end to next start
-        if (!markerPos && f < lastDrawFrame) {
-          for (let ji = 0; ji < jobs.length - 1; ji++) {
-            const a = jobs[ji], b = jobs[ji + 1];
-            if (f >= a.endF && f < b.startF) {
-              const t = (f - a.endF) / Math.max(1, b.startF - a.endF);
-              const pa = a.type === 'stroke' ? a.pts[a.pts.length - 1] : [WB_W / 2, 660];
-              const pb = b.type === 'stroke' ? b.pts[0] : [WB_W / 2, 660];
-              markerPos = [pa[0] + (pb[0] - pa[0]) * t, pa[1] + (pb[1] - pa[1]) * t];
-              lifted = true;
-              break;
-            }
-          }
-        }
-        if (markerPos && f < lastDrawFrame) wbDrawHand(ctx, markerPos[0], markerPos[1], lifted);
-        fs.writeFileSync(path.join(frameDir, 'fr' + String(f).padStart(4, '0') + '.jpg'), canvas.toBuffer('image/jpeg', { quality: 0.92 }));
+        const clip=path.join(tempDir,'scene'+sIdx+'.mp4');
+        execSync('"'+ffmpegPath+'" -y -framerate '+(WB_FPS||30)+' -i "'+path.join(frameDir,'fr%04d.jpg')+'" -c:v libx264 -preset medium -crf 16 -pix_fmt yuv420p "'+clip+'"',{timeout:300000});
+        fs.rmSync(frameDir,{recursive:true,force:true}); sceneClips.push(clip);
+        console.log('SVG scene',sIdx+1,'rendered');
       }
-
-      const clip = path.join(tempDir, 'scene' + sIdx + '.mp4');
-      // subtle camera push-in for a living, professional feel
-      execSync('"' + ffmpegPath + '" -y -framerate ' + WB_FPS + ' -i "' + path.join(frameDir, 'fr%04d.jpg') + '" -vf "scale=1600:900,zoompan=z=\'min(1+0.00055*on,1.10)\':d=1:x=\'iw/2-(iw/zoom/2)\':y=\'ih/2-(ih/zoom/2)\':s=1280x720:fps=' + WB_FPS + '" -c:v libx264 -preset fast -pix_fmt yuv420p "' + clip + '"', { timeout: 240000 });
-      fs.rmSync(frameDir, { recursive: true, force: true });
-      sceneClips.push(clip);
-      console.log('Scene', sIdx + 1, 'drawn (' + jobs.length + ' strokes)');
     }
-    if (sceneClips.length === 0) throw new Error('No scenes could be animated');
 
-    // Voiceover (same pipeline as cinematic)
+    if (!sceneClips.length) throw new Error('No scenes rendered');
+
+    // Voiceover
     let audioFile = null;
     if (voiceoverText && ELEVENLABS_KEY) {
       try {
@@ -648,39 +559,37 @@ app.post('/api/whiteboard/animate', async (req, res) => {
           method: 'POST',
           headers: { 'xi-api-key': ELEVENLABS_KEY, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
           body: JSON.stringify({
-            text: voiceoverText.replace(/\[.*?\]/g, '').replace(/SCENE.*?:\s*/gi, '').replace(/HOOK.*?:\s*/gi, '').replace(/PROBLEM.*?:\s*/gi, '').replace(/SOLUTION.*?:\s*/gi, '').replace(/PROOF.*?:\s*/gi, '').replace(/CTA.*?:\s*/gi, '').replace(/\*\*Word count:.*?\*\*/gi, '').replace(/Word count:.*?words/gi, '').replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 2000),
+            text: voiceoverText.replace(/\[.*?\]/g,'').replace(/SCENE.*?:\s*/gi,'').replace(/\n+/g,' ').replace(/\s+/g,' ').trim().substring(0,2000),
             model_id: 'eleven_multilingual_v2',
             voice_settings: { stability: 0.5, similarity_boost: 0.75 }
           })
         });
-        if (vr.ok) { audioFile = path.join(tempDir, 'voice.mp3'); fs.writeFileSync(audioFile, Buffer.from(await vr.arrayBuffer())); console.log('Voiceover ready'); }
-      } catch (e) { console.log('Voice error:', e.message); }
+        if (vr.ok) { audioFile = path.join(tempDir,'voice.mp3'); fs.writeFileSync(audioFile, Buffer.from(await vr.arrayBuffer())); console.log('Voiceover ready'); }
+      } catch(e) { console.log('Voice error:', e.message); }
     }
 
-    const listFile = path.join(tempDir, 'list.txt');
-    fs.writeFileSync(listFile, sceneClips.map(f => "file '" + f + "'").join('\n'));
-    const stitched = path.join(tempDir, 'stitched.mp4');
-    execSync('"' + ffmpegPath + '" -f concat -safe 0 -i "' + listFile + '" -c copy "' + stitched + '" -y', { timeout: 120000 });
-
+    // Concat + mux
+    const listFile = path.join(tempDir,'list.txt');
+    fs.writeFileSync(listFile, sceneClips.map(f=>"file '"+f+"'").join('\n'));
+    const stitched = path.join(tempDir,'stitched.mp4');
+    execSync('"'+ffmpegPath+'" -f concat -safe 0 -i "'+listFile+'" -c copy "'+stitched+'" -y', {timeout:120000});
     let finalPath = stitched;
     if (audioFile && fs.existsSync(audioFile)) {
-      const withAudio = path.join(tempDir, 'final.mp4');
-      const dur = sceneClips.length * perScene;
-      execSync('"' + ffmpegPath + '" -i "' + stitched + '" -i "' + audioFile + '" -map 0:v -map 1:a -c:v copy -c:a aac -t ' + dur + ' "' + withAudio + '" -y', { timeout: 120000 });
+      const withAudio = path.join(tempDir,'final.mp4');
+      execSync('"'+ffmpegPath+'" -i "'+stitched+'" -i "'+audioFile+'" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "'+withAudio+'" -y', {timeout:120000});
       finalPath = withAudio;
     }
     const out = fs.readFileSync(finalPath);
-    console.log('Whiteboard 2.0 video ready:', out.length, 'bytes');
-    res.set('Content-Type', 'video/mp4');
-    res.set('Content-Disposition', 'attachment; filename="enerstudio-whiteboard.mp4"');
-    res.send(out);
-  } catch (e) {
-    console.error('Whiteboard 2.0 error:', e.message);
+    console.log('Whiteboard Raster v8.1.0 ready:', out.length, 'bytes');
+    res.set('Content-Type','video/mp4'); res.set('Content-Disposition','attachment; filename="enerstudio-whiteboard.mp4"'); res.send(out);
+  } catch(e) {
+    console.error('Whiteboard Raster error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
-    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch (e) {}
+    try { fs.rmSync(tempDir, {recursive:true,force:true}); } catch(e) {}
   }
 });
+
 
 // ===== WHITEBOARD: build animated whiteboard video from sketch images + voiceover =====
 // Cost: zero video-generation credits — animation is done by FFmpeg on this server.
