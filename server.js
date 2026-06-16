@@ -19,7 +19,7 @@ app.use(express.json({ limit: '50mb' }));
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.1.0',
+    version: '8.2.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -350,243 +350,117 @@ app.post('/api/runway/stitch', async (req, res) => {
   }
 });
 
-// ===== WHITEBOARD v8.1.0: RASTER REVEAL ENGINE (VideoScribe method) =====
-// Source = Runway gen4_image professional illustration (PNG/JPG, white background)
-// Algorithm: threshold ink pixels → connected components → spatially order →
-//   reveal pixel-by-pixel with hand following → stitch + voiceover → MP4
-// Quality scales with image source quality — Runway gen4 master-ink prompt = professional grade
+// ===== WHITEBOARD v8.2.0: PURE FFMPEG REVEAL ENGINE =====
+// NO Python, NO numpy, NO native dependencies — works on Render free tier
+// Method: xfade wipe reveals illustration over white canvas + hand overlay
+// Each scene: white→illustration wipe (3s) + hold (remainder) + moving hand PNG
+// Cost: ~2 Runway credits per scene image (gen4_image), zero video credits
 
-let sharp = null;
-try { sharp = require('sharp'); } catch(e) {}
-const { execFileSync } = require('child_process');
+const HAND_B64 = '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';
 
-// Pure-JS image operations (no canvas needed for raster reveal)
 app.post('/api/whiteboard/animate', async (req, res) => {
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enerstudio-raster-'));
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enerstudio-wb-'));
   try {
-    const { svgScenes, imageUrls, voiceoverText, voiceId, secondsPerScene } = req.body;
-    const perScene = Math.max(5, Math.min(12, parseInt(secondsPerScene) || 8));
-
-    // Support both SVG (legacy) and imageUrl (new raster) modes
-    const sources = imageUrls && imageUrls.length ? imageUrls : null;
-    if (!sources && (!svgScenes || !svgScenes.length)) {
-      return res.status(400).json({ error: 'Provide either imageUrls (raster mode) or svgScenes (legacy mode)' });
+    const { imageUrls, voiceoverText, voiceId, secondsPerScene } = req.body;
+    if (!imageUrls || imageUrls.length === 0) {
+      return res.status(400).json({ error: 'No image URLs provided' });
     }
+    const perScene = Math.max(6, Math.min(12, parseInt(secondsPerScene) || 8));
+    const revealDur = Math.min(3.5, perScene - 2);
+    console.log('Whiteboard v8.2.0: FFmpeg-only,', imageUrls.length, 'scenes x', perScene + 's');
 
-    console.log('Whiteboard Raster v8.1.0: mode =', sources ? 'raster' : 'svg-fallback',
-                '| scenes =', sources ? sources.length : svgScenes.length);
+    // Write hand PNG from embedded base64 — no external file needed
+    const handPath = path.join(tempDir, 'hand.png');
+    fs.writeFileSync(handPath, Buffer.from(HAND_B64, 'base64'));
 
+    // Render each scene: white wipe reveals illustration, hand follows wipe front
     const sceneClips = [];
+    const transitions = ['wipeleft', 'wipedown', 'wiperight', 'wipetl', 'wipeleft', 'wipedown', 'wiperight', 'wipetl'];
+    
+    for (let i = 0; i < imageUrls.length; i++) {
+      // Download source image
+      const imgPath = path.join(tempDir, 'img' + i + '.jpg');
+      const ir = await fetch(imageUrls[i]);
+      if (!ir.ok) throw new Error('Image ' + i + ' download failed: ' + ir.status);
+      fs.writeFileSync(imgPath, Buffer.from(await ir.arrayBuffer()));
 
-    if (sources) {
-      // ── RASTER REVEAL MODE ──────────────────────────────────────────────────
-      for (let sIdx = 0; sIdx < sources.length; sIdx++) {
-        // 1. Fetch source image
-        const imgPath = path.join(tempDir, `src${sIdx}.jpg`);
-        const ir = await fetch(sources[sIdx]);
-        if (!ir.ok) throw new Error(`Image ${sIdx} fetch failed: ${ir.status}`);
-        fs.writeFileSync(imgPath, Buffer.from(await ir.arrayBuffer()));
-        console.log(`Scene ${sIdx+1} image downloaded`);
+      const clip = path.join(tempDir, 'scene' + i + '.mp4');
+      const tr = transitions[i % transitions.length];
+      
+      // Hand movement: follows wipe from left to right during reveal, then stays at right
+      // x moves 0 → 1100 over revealDur seconds, y stays at vertical center (290)
+      const handX = "if(lt(t," + revealDur + "),(t/" + revealDur + ")*1100,1100)";
+      
+      const filterComplex = [
+        "[0:v]format=yuv420p[white]",
+        "[1:v]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,setsar=1,format=yuv420p[im]",
+        "[white][im]xfade=transition=" + tr + ":duration=" + revealDur + ":offset=0.3,format=yuv420p[wipe]",
+        "[2:v]scale=140:140[hand]",
+        "[wipe][hand]overlay=x='" + handX + "':y=270,format=yuv420p[out]"
+      ].join(";");
 
-        // 2. Use Python raster-reveal script for this scene
-        const frameDir = path.join(tempDir, `f${sIdx}`);
-        fs.mkdirSync(frameDir);
-        const pyScript = path.join(tempDir, `reveal${sIdx}.py`);
-        fs.writeFileSync(pyScript, `
-import numpy as np, math, os, shutil
-from PIL import Image, ImageDraw
-from skimage import measure, morphology
-
-FPS=30
-DRAW_SECS=${perScene}
-HOLD=round(FPS*1.2)
-
-src=Image.open(${JSON.stringify(imgPath)}).convert('RGB')
-W,H=src.size
-arr=np.array(src)
-gray=arr[:,:,0].astype(int)+arr[:,:,1].astype(int)+arr[:,:,2].astype(int)
-not_white=(gray<720)
-reveal_mask=not_white.astype(np.uint8)
-labeled=measure.label(reveal_mask,connectivity=2)
-regions=[r for r in measure.regionprops(labeled) if r.area>=20]
-regions.sort(key=lambda r:(int(r.centroid[0]/80),r.centroid[1]))
-region_pixels=[]
-for r in regions:
-    m=(labeled==r.label)&(reveal_mask==1)
-    ys,xs=np.where(m)
-    pts=sorted(zip(ys.tolist(),xs.tolist()))
-    region_pixels.append([(x,y) for y,x in pts])
-total_px=sum(len(p) for p in region_pixels)
-draw_frames=DRAW_SECS*FPS
-cum=0
-for i,r in enumerate(regions):
-    px=len(region_pixels[i])
-    span=max(2,round(px/max(1,total_px)*draw_frames))
-    r._start=round(cum/max(1,total_px)*draw_frames)
-    r._end=r._start+span
-    cum+=px
-if not regions:
-    total_frames=DRAW_SECS*FPS+HOLD
-else:
-    total_frames=regions[-1]._end+HOLD
-def ease(t): return 2*t*t if t<0.5 else 1-((-2*t+2)**2)/2
-def hand(d,x,y,lifted):
-    s=1.05 if lifted else 1.0
-    def T(px,py):
-        c,sn=math.cos(0.10),math.sin(0.10)
-        return(x+(px*c-py*sn)*s,y+(px*sn+py*c)*s)
-    d.ellipse([x+30*s,y+95*s,x+190*s,y+135*s],fill=(242,242,242))
-    d.line([T(3,-3),T(50,-50)],fill=(26,39,64),width=int(15*s))
-    d.line([T(1,-1),T(12,-12)],fill=(138,143,152),width=int(7*s))
-    sk=(232,180,142);skd=(201,142,99)
-    d.polygon([T(22,-28),T(50,-44),T(66,-26),T(44,-14)],fill=sk,outline=skd)
-    d.polygon([T(14,-6),T(40,-32),T(62,-30),T(62,-16),T(18,0)],fill=sk,outline=skd)
-    d.polygon([T(30,2),T(70,-22),T(112,-14),T(140,10),T(140,50),T(120,76),T(70,86),T(40,60)],fill=sk,outline=skd)
-    d.polygon([T(96,70),T(150,120),T(190,86),T(136,40)],fill=sk,outline=skd)
-    d.polygon([T(136,106),T(176,142),T(230,96),T(190,60)],fill=(59,77,113),outline=(42,58,88))
-canvas=np.full((H,W,3),255,dtype=np.uint8)
-last_draw=regions[-1]._end if regions else draw_frames
-for f in range(total_frames):
-    hp=None;lifted=False
-    for ri,r in enumerate(regions):
-        if f<r._start: break
-        pr=1.0 if f>=r._end else (f-r._start)/max(1,r._end-r._start)
-        prog=ease(pr) if pr<1 else 1.0
-        pxl=region_pixels[ri]
-        n=max(1,int(len(pxl)*prog))
-        for px,py in pxl[:n]: canvas[py,px]=arr[py,px]
-        if pr<1 and pxl:
-            w=pxl[max(0,n-8):n]
-            hp=[sum(p[0] for p in w)/len(w),sum(p[1] for p in w)/len(w)]
-    if hp is None and f<last_draw:
-        for ri in range(len(regions)-1):
-            a,b=regions[ri],regions[ri+1]
-            if a._end<=f<b._start:
-                t=ease((f-a._end)/max(1,b._start-a._end))
-                ap=region_pixels[ri][-1] if region_pixels[ri] else [W//2,H//2]
-                bp=region_pixels[ri+1][0] if region_pixels[ri+1] else [W//2,H//2]
-                hp=[ap[0]+(bp[0]-ap[0])*t,ap[1]+(bp[1]-ap[1])*t]
-                lifted=True;break
-    img=Image.fromarray(canvas.copy())
-    d=ImageDraw.Draw(img)
-    if hp and f<last_draw: hand(d,hp[0],hp[1],lifted)
-    img.save(f'${frameDir}/fr{f:04d}.jpg',quality=97)
-print(f'raster_reveal_done:{total_frames}')
-`);
-        const pyOut = execFileSync('python3', [pyScript], { timeout: 600000, encoding: 'utf8' });
-        const totalFrames = parseInt((pyOut.match(/raster_reveal_done:(\d+)/) || [,'120'])[1]);
-        console.log(`Scene ${sIdx+1} raster reveal: ${totalFrames} frames`);
-
-        // 3. Encode scene clip
-        const clip = path.join(tempDir, `scene${sIdx}.mp4`);
-        execSync(`"${ffmpegPath}" -y -framerate 30 -i "${path.join(frameDir,'fr%04d.jpg')}" -c:v libx264 -preset medium -crf 16 -pix_fmt yuv420p "${clip}"`, { timeout: 300000 });
-        fs.rmSync(frameDir, { recursive: true, force: true });
-        sceneClips.push(clip);
-      }
-
-    } else {
-      // ── SVG FALLBACK MODE (legacy) ──────────────────────────────────────────
-      // Keep existing SVG draw-on engine for backward compatibility
-      for (let sIdx = 0; sIdx < svgScenes.length; sIdx++) {
-        if (!createCanvas) return res.status(500).json({ error: 'Canvas not available for SVG mode' });
-        const els = wbParseSvg(svgScenes[sIdx]);
-        if (!els.length) continue;
-        const jobs = [];
-        let elIdx = 0;
-        for (const el of els) {
-          if (el.tag === 'text') { if (el.text) jobs.push({ type: 'text', el, weight: el.text.length * 14 }); }
-          else { const pls = wbElementPoints(el); for (const raw of pls) { if (raw.length > 1) { jobs.push({ type: 'stroke', el, raw, pts: wbWobble(raw, elIdx), weight: raw.length }); elIdx++; } } }
-          elIdx++;
-        }
-        if (!jobs.length) continue;
-        const holdFrames = Math.round((WB_FPS||30) * 1.1);
-        const jobFn = j => j.type==='stroke' ? j.raw[0] : [WB_W/2,WB_H-90];
-        const jobEnd = j => j.type==='stroke' ? j.raw[j.raw.length-1] : [WB_W/2,WB_H-90];
-        const travels = []; let ttotal = 0;
-        for (let ji = 0; ji < jobs.length-1; ji++) { const d=Math.hypot(jobFn(jobs[ji+1])[0]-jobEnd(jobs[ji])[0],jobFn(jobs[ji+1])[1]-jobEnd(jobs[ji])[1]); const tf=Math.max(1,Math.min(6,Math.round(d/250))); travels.push(tf); ttotal+=tf; }
-        const drawFrames = Math.max(jobs.length*2, perScene*(WB_FPS||30)-holdFrames-ttotal);
-        const totalWeight = jobs.reduce((a,j)=>a+j.weight,0); let cursor=0;
-        for (let ji=0;ji<jobs.length;ji++){const j=jobs[ji];const span=Math.max(2,Math.round(j.weight/totalWeight*drawFrames));j.startF=cursor;j.endF=cursor+span;cursor=j.endF+(ji<travels.length?travels[ji]:0);}
-        const lastDraw=jobs[jobs.length-1].endF; const totalFrames=lastDraw+holdFrames;
-        const canvas=createCanvas(WB_W||1920,WB_H||1080); const ctx=canvas.getContext('2d');
-        const frameDir=path.join(tempDir,'f'+sIdx); fs.mkdirSync(frameDir);
-        function wbEase(t){return t<0.5?2*t*t:1-Math.pow(-2*t+2,2)/2;}
-        for (let f=0;f<totalFrames;f++){
-          ctx.setTransform(1,0,0,1,0,0); ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,WB_W||1920,WB_H||1080);
-          let handPos=null,lifted=false;
-          for (const j of jobs){
-            const rp=f>=j.endF?1:f<=j.startF?0:(f-j.startF)/(j.endF-j.startF);
-            if(rp<=0)continue; const prog=rp>=1?1:wbEase(rp);
-            const A=j.el.attrs; const strokeC=(A.stroke&&A.stroke!=='none')?A.stroke:'#111111';
-            const sw=(parseFloat(A['stroke-width'])||3)*(WB_SCALE||1.5);
-            if(j.type==='stroke'){
-              const n=Math.max(1,Math.floor(j.pts.length*prog));
-              if(prog>=1&&A.fill&&A.fill!=='none'&&A.fill!=='white'&&A.fill!=='#ffffff'){ctx.fillStyle=A.fill;ctx.beginPath();ctx.moveTo(j.pts[0][0],j.pts[0][1]);for(let p=1;p<j.pts.length;p++)ctx.lineTo(j.pts[p][0],j.pts[p][1]);ctx.closePath();ctx.fill();}
-              ctx.strokeStyle=strokeC;ctx.lineWidth=sw;ctx.lineCap='round';ctx.lineJoin='round';
-              ctx.beginPath();ctx.moveTo(j.pts[0][0],j.pts[0][1]);for(let p=1;p<n;p++)ctx.lineTo(j.pts[p][0],j.pts[p][1]);ctx.stroke();
-              if(prog<1){const i0=Math.min(n,j.raw.length-1);let hx=0,hy=0,cnt=0;for(let w=-4;w<=4;w++){const k=Math.min(j.raw.length-1,Math.max(0,i0+w));hx+=j.raw[k][0];hy+=j.raw[k][1];cnt++;}handPos=[hx/cnt,hy/cnt];}
-            } else {
-              const full=j.el.text;const n=Math.max(0,Math.floor(full.length*prog));
-              const fs2=(parseFloat(A['font-size'])||40)*(WB_SCALE||1.5);
-              ctx.font='bold '+fs2+'px sans-serif';ctx.fillStyle=(A.fill&&A.fill!=='none')?A.fill:'#111111';ctx.textBaseline='alphabetic';
-              const tx=(parseFloat(A.x)||0)*(WB_SCALE||1.5),ty=(parseFloat(A.y)||0)*(WB_SCALE||1.5);
-              const anchor=A['text-anchor'];let drawX=tx;
-              if(anchor==='middle')drawX=tx-ctx.measureText(full).width/2;else if(anchor==='end')drawX=tx-ctx.measureText(full).width;
-              ctx.fillText(full.substring(0,n),drawX,ty);
-              if(prog<1&&n>0){handPos=[drawX+ctx.measureText(full.substring(0,n)).width,ty-fs2*0.3];}
-            }
-          }
-          if(!handPos&&f<lastDraw){for(let ji=0;ji<jobs.length-1;ji++){const a=jobs[ji],b=jobs[ji+1];if(a.endF<=f&&f<b.startF){const t=wbEase((f-a.endF)/Math.max(1,b.startF-a.endF));const pa=a.type==='stroke'?a.raw[a.raw.length-1]:[(WB_W||1920)/2,(WB_H||1080)-90];const pb=b.type==='stroke'?b.raw[0]:[(WB_W||1920)/2,(WB_H||1080)-90];handPos=[pa[0]+(pb[0]-pa[0])*t,pa[1]+(pb[1]-pa[1])*t];lifted=true;break;}}}
-          if(handPos&&f<lastDraw){ctx.save();ctx.translate(handPos[0],handPos[1]);ctx.rotate(0.10);const S=(WB_SCALE||1.5)*(lifted?1.05:1);/* simplified hand */ctx.fillStyle='#e8b48e';ctx.fillRect(0,-30,60,80);ctx.restore();}
-          fs.writeFileSync(path.join(frameDir,'fr'+String(f).padStart(4,'0')+'.jpg'),canvas.toBuffer('image/jpeg',{quality:0.97}));
-        }
-        const clip=path.join(tempDir,'scene'+sIdx+'.mp4');
-        execSync('"'+ffmpegPath+'" -y -framerate '+(WB_FPS||30)+' -i "'+path.join(frameDir,'fr%04d.jpg')+'" -c:v libx264 -preset medium -crf 16 -pix_fmt yuv420p "'+clip+'"',{timeout:300000});
-        fs.rmSync(frameDir,{recursive:true,force:true}); sceneClips.push(clip);
-        console.log('SVG scene',sIdx+1,'rendered');
-      }
+      execSync(
+        '"' + ffmpegPath + '" -y' +
+        ' -f lavfi -i "color=white:s=1280x720:d=' + perScene + ':r=25"' +
+        ' -loop 1 -t ' + perScene + ' -i "' + imgPath + '"' +
+        ' -loop 1 -i "' + handPath + '"' +
+        ' -filter_complex "' + filterComplex + '"' +
+        ' -map "[out]" -t ' + perScene +
+        ' -c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p' +
+        ' "' + clip + '"',
+        { timeout: 120000 }
+      );
+      sceneClips.push(clip);
+      console.log('Scene', i + 1, '/' + imageUrls.length, 'rendered (' + tr + ')');
     }
 
-    if (!sceneClips.length) throw new Error('No scenes rendered');
-
-    // Voiceover
+    // Voiceover via ElevenLabs
     let audioFile = null;
     if (voiceoverText && ELEVENLABS_KEY) {
       try {
         let vid = voiceId || await getFirstVoice();
         if (!vid) vid = 'EXAVITQu4vr4xnSDxMaL';
+        const cleanText = voiceoverText
+          .replace(/\[.*?\]/g, '').replace(/SCENE.*?:\s*/gi, '')
+          .replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 2000);
         const vr = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + vid, {
           method: 'POST',
           headers: { 'xi-api-key': ELEVENLABS_KEY, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
-          body: JSON.stringify({
-            text: voiceoverText.replace(/\[.*?\]/g,'').replace(/SCENE.*?:\s*/gi,'').replace(/\n+/g,' ').replace(/\s+/g,' ').trim().substring(0,2000),
-            model_id: 'eleven_multilingual_v2',
-            voice_settings: { stability: 0.5, similarity_boost: 0.75 }
-          })
+          body: JSON.stringify({ text: cleanText, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.5, similarity_boost: 0.75 } })
         });
-        if (vr.ok) { audioFile = path.join(tempDir,'voice.mp3'); fs.writeFileSync(audioFile, Buffer.from(await vr.arrayBuffer())); console.log('Voiceover ready'); }
+        if (vr.ok) {
+          audioFile = path.join(tempDir, 'voice.mp3');
+          fs.writeFileSync(audioFile, Buffer.from(await vr.arrayBuffer()));
+          console.log('Voiceover ready');
+        } else { console.log('Voiceover failed:', vr.status); }
       } catch(e) { console.log('Voice error:', e.message); }
     }
 
-    // Concat + mux
-    const listFile = path.join(tempDir,'list.txt');
-    fs.writeFileSync(listFile, sceneClips.map(f=>"file '"+f+"'").join('\n'));
-    const stitched = path.join(tempDir,'stitched.mp4');
-    execSync('"'+ffmpegPath+'" -f concat -safe 0 -i "'+listFile+'" -c copy "'+stitched+'" -y', {timeout:120000});
+    // Concat all scene clips
+    const listFile = path.join(tempDir, 'list.txt');
+    fs.writeFileSync(listFile, sceneClips.map(f => "file '" + f + "'").join('\n'));
+    const stitched = path.join(tempDir, 'stitched.mp4');
+    execSync('"' + ffmpegPath + '" -f concat -safe 0 -i "' + listFile + '" -c copy "' + stitched + '" -y', { timeout: 120000 });
+
+    // Mux voiceover
     let finalPath = stitched;
     if (audioFile && fs.existsSync(audioFile)) {
-      const withAudio = path.join(tempDir,'final.mp4');
-      execSync('"'+ffmpegPath+'" -i "'+stitched+'" -i "'+audioFile+'" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "'+withAudio+'" -y', {timeout:120000});
+      const withAudio = path.join(tempDir, 'final.mp4');
+      execSync('"' + ffmpegPath + '" -i "' + stitched + '" -i "' + audioFile + '" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "' + withAudio + '" -y', { timeout: 120000 });
       finalPath = withAudio;
     }
-    const out = fs.readFileSync(finalPath);
-    console.log('Whiteboard Raster v8.1.0 ready:', out.length, 'bytes');
-    res.set('Content-Type','video/mp4'); res.set('Content-Disposition','attachment; filename="enerstudio-whiteboard.mp4"'); res.send(out);
+
+    const finalVideo = fs.readFileSync(finalPath);
+    console.log('Whiteboard v8.2.0 ready:', finalVideo.length, 'bytes,', imageUrls.length, 'scenes');
+    res.set('Content-Type', 'video/mp4');
+    res.set('Content-Disposition', 'attachment; filename="enerstudio-whiteboard.mp4"');
+    res.send(finalVideo);
+
   } catch(e) {
-    console.error('Whiteboard Raster error:', e.message);
+    console.error('Whiteboard v8.2.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
-    try { fs.rmSync(tempDir, {recursive:true,force:true}); } catch(e) {}
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(e) {}
   }
 });
 
