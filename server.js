@@ -397,7 +397,7 @@ import numpy as np, math, os, shutil
 from PIL import Image, ImageDraw
 from skimage import measure, morphology
 
-FPS=${WB_FPS || 30}
+FPS=30
 DRAW_SECS=${perScene}
 HOLD=round(FPS*1.2)
 
@@ -479,7 +479,7 @@ print(f'raster_reveal_done:{total_frames}')
 
         // 3. Encode scene clip
         const clip = path.join(tempDir, `scene${sIdx}.mp4`);
-        execSync(`"${ffmpegPath}" -y -framerate ${WB_FPS||30} -i "${path.join(frameDir,'fr%04d.jpg')}" -c:v libx264 -preset medium -crf 16 -pix_fmt yuv420p "${clip}"`, { timeout: 300000 });
+        execSync(`"${ffmpegPath}" -y -framerate 30 -i "${path.join(frameDir,'fr%04d.jpg')}" -c:v libx264 -preset medium -crf 16 -pix_fmt yuv420p "${clip}"`, { timeout: 300000 });
         fs.rmSync(frameDir, { recursive: true, force: true });
         sceneClips.push(clip);
       }
