@@ -19,7 +19,7 @@ app.use(express.json({ limit: '50mb' }));
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.2.0',
+    version: '8.3.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -350,13 +350,12 @@ app.post('/api/runway/stitch', async (req, res) => {
   }
 });
 
-// ===== WHITEBOARD v8.2.0: PURE FFMPEG REVEAL ENGINE =====
-// NO Python, NO numpy, NO native dependencies — works on Render free tier
-// Method: xfade wipe reveals illustration over white canvas + hand overlay
-// Each scene: white→illustration wipe (3s) + hold (remainder) + moving hand PNG
-// Cost: ~2 Runway credits per scene image (gen4_image), zero video credits
+// ===== WHITEBOARD v8.3.0: RASTER REVEAL + FFmpeg FALLBACK =====
+// Primary: Python pixel-by-pixel reveal (professional hand-draws strokes progressively)
+// Fallback: FFmpeg wipe reveal (if Python packages not yet installed)
+// Python packages auto-installed at server startup
 
-const HAND_B64 = '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';
+const HAND_B64_WB = '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';
 
 app.post('/api/whiteboard/animate', async (req, res) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enerstudio-wb-'));
@@ -366,101 +365,171 @@ app.post('/api/whiteboard/animate', async (req, res) => {
       return res.status(400).json({ error: 'No image URLs provided' });
     }
     const perScene = Math.max(6, Math.min(12, parseInt(secondsPerScene) || 8));
-    const revealDur = Math.min(3.5, perScene - 2);
-    console.log('Whiteboard v8.2.0: FFmpeg-only,', imageUrls.length, 'scenes x', perScene + 's');
+    console.log('Whiteboard v8.3.0: ' + imageUrls.length + ' scenes, pythonReady=' + pythonReady);
 
-    // Write hand PNG from embedded base64 — no external file needed
+    // Write hand PNG
     const handPath = path.join(tempDir, 'hand.png');
-    fs.writeFileSync(handPath, Buffer.from(HAND_B64, 'base64'));
+    fs.writeFileSync(handPath, Buffer.from(HAND_B64_WB, 'base64'));
 
-    // Render each scene: white wipe reveals illustration, hand follows wipe front
     const sceneClips = [];
-    const transitions = ['wipeleft', 'wipedown', 'wiperight', 'wipetl', 'wipeleft', 'wipedown', 'wiperight', 'wipetl'];
-    
+    const transitions = ['wipeleft','wipedown','wiperight','wipetl','wipeleft','wipedown','wiperight','wipetl'];
+
     for (let i = 0; i < imageUrls.length; i++) {
-      // Download source image
       const imgPath = path.join(tempDir, 'img' + i + '.jpg');
       const ir = await fetch(imageUrls[i]);
       if (!ir.ok) throw new Error('Image ' + i + ' download failed: ' + ir.status);
       fs.writeFileSync(imgPath, Buffer.from(await ir.arrayBuffer()));
 
       const clip = path.join(tempDir, 'scene' + i + '.mp4');
-      const tr = transitions[i % transitions.length];
-      
-      // Hand movement: follows wipe from left to right during reveal, then stays at right
-      // x moves 0 → 1100 over revealDur seconds, y stays at vertical center (290)
-      const handX = "if(lt(t," + revealDur + "),(t/" + revealDur + ")*1100,1100)";
-      
-      const filterComplex = [
-        "[0:v]format=yuv420p[white]",
-        "[1:v]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,setsar=1,format=yuv420p[im]",
-        "[white][im]xfade=transition=" + tr + ":duration=" + revealDur + ":offset=0.3,format=yuv420p[wipe]",
-        "[2:v]scale=140:140[hand]",
-        "[wipe][hand]overlay=x='" + handX + "':y=270,format=yuv420p[out]"
-      ].join(";");
 
-      execSync(
-        '"' + ffmpegPath + '" -y' +
-        ' -f lavfi -i "color=white:s=1280x720:d=' + perScene + ':r=25"' +
-        ' -loop 1 -t ' + perScene + ' -i "' + imgPath + '"' +
-        ' -loop 1 -i "' + handPath + '"' +
-        ' -filter_complex "' + filterComplex + '"' +
-        ' -map "[out]" -t ' + perScene +
-        ' -c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p' +
-        ' "' + clip + '"',
-        { timeout: 120000 }
-      );
+      if (pythonReady) {
+        // ── RASTER REVEAL: hand draws strokes progressively ──────────────
+        const frameDir = path.join(tempDir, 'f' + i);
+        fs.mkdirSync(frameDir);
+        const pyScript = path.join(tempDir, 'reveal' + i + '.py');
+
+        const pyCode = `
+import numpy as np, math, os
+from PIL import Image, ImageDraw
+from skimage import measure, morphology
+
+FPS=25
+DRAW_SECS=${perScene - 1}
+HOLD=round(FPS*1.5)
+
+src=Image.open(${JSON.stringify(imgPath)}).convert('RGB')
+W,H=src.size
+arr=np.array(src)
+gray=arr[:,:,0].astype(int)+arr[:,:,1].astype(int)+arr[:,:,2].astype(int)
+not_white=(gray<720)
+reveal_mask=not_white.astype(np.uint8)
+labeled=measure.label(reveal_mask,connectivity=2)
+regions=[r for r in measure.regionprops(labeled) if r.area>=15]
+regions.sort(key=lambda r:(int(r.centroid[0]/100),r.centroid[1]))
+region_pixels=[]
+for r in regions:
+    m=(labeled==r.label)&(reveal_mask==1)
+    ys,xs=np.where(m)
+    pts=sorted(zip(ys.tolist(),xs.tolist()))
+    region_pixels.append([(x,y) for y,x in pts])
+total_px=sum(len(p) for p in region_pixels)
+draw_frames=DRAW_SECS*FPS
+cum=0
+for i,r in enumerate(regions):
+    px=len(region_pixels[i])
+    span=max(2,round(px/max(1,total_px)*draw_frames))
+    r._start=round(cum/max(1,total_px)*draw_frames)
+    r._end=r._start+span
+    cum+=px
+last_draw=regions[-1]._end if regions else draw_frames
+total_frames=last_draw+HOLD
+def ease(t): return 2*t*t if t<0.5 else 1-((-2*t+2)**2)/2
+def hand(d,x,y,lifted):
+    s=1.05 if lifted else 1.0
+    def T(px,py):
+        c,sn=math.cos(0.10),math.sin(0.10)
+        return(x+(px*c-py*sn)*s,y+(px*sn+py*c)*s)
+    d.ellipse([x+25*s,y+80*s,x+160*s,y+115*s],fill=(242,242,242,255))
+    d.line([T(3,-3),T(45,-45)],fill=(26,39,64,255),width=int(13*s))
+    d.line([T(1,-1),T(10,-10)],fill=(138,143,152,255),width=int(6*s))
+    sk=(232,180,142,255);skd=(201,142,99,255)
+    d.polygon([T(20,-25),T(46,-40),T(60,-24),T(40,-13)],fill=sk,outline=skd)
+    d.polygon([T(13,-5),T(37,-29),T(56,-28),T(56,-15),T(16,0)],fill=sk,outline=skd)
+    d.polygon([T(28,2),T(65,-20),T(105,-13),T(130,9),T(130,46),T(112,70),T(65,80),T(37,56)],fill=sk,outline=skd)
+    d.polygon([T(90,65),T(138,112),T(175,80),T(128,36)],fill=sk,outline=skd)
+    d.polygon([T(128,100),T(162,134),T(210,90),T(175,56)],fill=(59,77,113,255),outline=(42,58,88,255))
+canvas=np.full((H,W,3),255,dtype=np.uint8)
+os.makedirs(${JSON.stringify(frameDir)}, exist_ok=True)
+for f in range(total_frames):
+    hp=None;lifted=False
+    for ri,r in enumerate(regions):
+        if f<r._start: break
+        pr=1.0 if f>=r._end else (f-r._start)/max(1,r._end-r._start)
+        prog=ease(pr) if pr<1 else 1.0
+        pxl=region_pixels[ri]
+        n=max(1,int(len(pxl)*prog))
+        for px,py in pxl[:n]: canvas[py,px]=arr[py,px]
+        if pr<1 and pxl:
+            w=pxl[max(0,n-6):n]
+            hp=[sum(p[0] for p in w)/len(w),sum(p[1] for p in w)/len(w)]
+    if hp is None and f<last_draw:
+        for ri in range(len(regions)-1):
+            a,b=regions[ri],regions[ri+1]
+            if a._end<=f<b._start:
+                t=ease((f-a._end)/max(1,b._start-a._end))
+                ap=region_pixels[ri][-1] if region_pixels[ri] else [W//2,H//2]
+                bp=region_pixels[ri+1][0] if region_pixels[ri+1] else [W//2,H//2]
+                hp=[ap[0]+(bp[0]-ap[0])*t,ap[1]+(bp[1]-ap[1])*t]
+                lifted=True;break
+    img=Image.fromarray(canvas.copy())
+    d=ImageDraw.Draw(img)
+    if hp and f<last_draw: hand(d,hp[0],hp[1],lifted)
+    img.save(f'${frameDir}/fr{f:04d}.jpg',quality=96)
+print(f'done:{total_frames}')
+`;
+        fs.writeFileSync(pyScript, pyCode);
+        const { execFileSync } = require('child_process');
+        const pyOut = execFileSync('python3', [pyScript], { timeout: 600000, encoding: 'utf8' });
+        const totalFrames = parseInt((pyOut.match(/done:(\d+)/) || [,'150'])[1]);
+        execSync('"' + ffmpegPath + '" -y -framerate 25 -i "' + path.join(frameDir, 'fr%04d.jpg') + '" -c:v libx264 -preset fast -crf 16 -pix_fmt yuv420p "' + clip + '"', { timeout: 300000 });
+        try { fs.rmSync(frameDir, { recursive: true, force: true }); } catch(e) {}
+        console.log('Scene', i+1, 'raster reveal done (' + totalFrames + ' frames)');
+
+      } else {
+        // ── FFMPEG WIPE FALLBACK (no Python) ─────────────────────────────
+        const tr = transitions[i % transitions.length];
+        const revealDur = Math.min(3.5, perScene - 2);
+        const handX = "if(lt(t," + revealDur + "),(t/" + revealDur + ")*1100,1100)";
+        const fc = [
+          "[0:v]format=yuv420p[white]",
+          "[1:v]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,setsar=1,format=yuv420p[im]",
+          "[white][im]xfade=transition=" + tr + ":duration=" + revealDur + ":offset=0.3,format=yuv420p[wipe]",
+          "[2:v]scale=140:140[hand]",
+          "[wipe][hand]overlay=x='" + handX + "':y=270,format=yuv420p[out]"
+        ].join(";");
+        execSync('"' + ffmpegPath + '" -y -f lavfi -i "color=white:s=1280x720:d=' + perScene + ':r=25" -loop 1 -t ' + perScene + ' -i "' + imgPath + '" -loop 1 -i "' + handPath + '" -filter_complex "' + fc + '" -map "[out]" -t ' + perScene + ' -c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p "' + clip + '"', { timeout: 120000 });
+        console.log('Scene', i+1, 'FFmpeg wipe fallback done');
+      }
       sceneClips.push(clip);
-      console.log('Scene', i + 1, '/' + imageUrls.length, 'rendered (' + tr + ')');
     }
 
-    // Voiceover via ElevenLabs
+    // Voiceover
     let audioFile = null;
     if (voiceoverText && ELEVENLABS_KEY) {
       try {
         let vid = voiceId || await getFirstVoice();
         if (!vid) vid = 'EXAVITQu4vr4xnSDxMaL';
-        const cleanText = voiceoverText
-          .replace(/\[.*?\]/g, '').replace(/SCENE.*?:\s*/gi, '')
-          .replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim().substring(0, 2000);
+        const cleanText = voiceoverText.replace(/\[.*?\]/g,'').replace(/SCENE.*?:\s*/gi,'').replace(/\n+/g,' ').replace(/\s+/g,' ').trim().substring(0,2000);
         const vr = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + vid, {
           method: 'POST',
           headers: { 'xi-api-key': ELEVENLABS_KEY, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
           body: JSON.stringify({ text: cleanText, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.5, similarity_boost: 0.75 } })
         });
-        if (vr.ok) {
-          audioFile = path.join(tempDir, 'voice.mp3');
-          fs.writeFileSync(audioFile, Buffer.from(await vr.arrayBuffer()));
-          console.log('Voiceover ready');
-        } else { console.log('Voiceover failed:', vr.status); }
+        if (vr.ok) { audioFile = path.join(tempDir,'voice.mp3'); fs.writeFileSync(audioFile, Buffer.from(await vr.arrayBuffer())); console.log('Voiceover ready'); }
+        else { console.log('Voiceover failed:', vr.status); }
       } catch(e) { console.log('Voice error:', e.message); }
     }
 
-    // Concat all scene clips
+    // Concat + mux
     const listFile = path.join(tempDir, 'list.txt');
     fs.writeFileSync(listFile, sceneClips.map(f => "file '" + f + "'").join('\n'));
     const stitched = path.join(tempDir, 'stitched.mp4');
     execSync('"' + ffmpegPath + '" -f concat -safe 0 -i "' + listFile + '" -c copy "' + stitched + '" -y', { timeout: 120000 });
-
-    // Mux voiceover
     let finalPath = stitched;
     if (audioFile && fs.existsSync(audioFile)) {
       const withAudio = path.join(tempDir, 'final.mp4');
       execSync('"' + ffmpegPath + '" -i "' + stitched + '" -i "' + audioFile + '" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "' + withAudio + '" -y', { timeout: 120000 });
       finalPath = withAudio;
     }
-
-    const finalVideo = fs.readFileSync(finalPath);
-    console.log('Whiteboard v8.2.0 ready:', finalVideo.length, 'bytes,', imageUrls.length, 'scenes');
-    res.set('Content-Type', 'video/mp4');
-    res.set('Content-Disposition', 'attachment; filename="enerstudio-whiteboard.mp4"');
-    res.send(finalVideo);
+    const out = fs.readFileSync(finalPath);
+    console.log('Whiteboard v8.3.0 ready:', out.length, 'bytes, pythonReady=' + pythonReady);
+    res.set('Content-Type','video/mp4'); res.set('Content-Disposition','attachment; filename="enerstudio-whiteboard.mp4"'); res.send(out);
 
   } catch(e) {
-    console.error('Whiteboard v8.2.0 error:', e.message);
+    console.error('Whiteboard v8.3.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
-    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(e) {}
+    try { fs.rmSync(tempDir, {recursive:true,force:true}); } catch(e) {}
   }
 });
 
@@ -635,6 +704,35 @@ app.post('/api/voice/generate', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ===== STARTUP: ensure Python packages available for whiteboard engine =====
+const { execSync: execSyncQ } = require('child_process');
+let pythonReady = false;
+function ensurePythonPackages() {
+  try {
+    execSyncQ('python3 -c "import numpy, PIL, skimage; print(numpy.__version__)"', { timeout: 10000 });
+    pythonReady = true;
+    console.log('Python packages: numpy/PIL/skimage already available');
+  } catch(e) {
+    console.log('Installing Python packages (numpy, Pillow, scikit-image)...');
+    try {
+      execSyncQ('pip3 install numpy Pillow scikit-image --quiet --break-system-packages', { timeout: 300000 });
+      pythonReady = true;
+      console.log('Python packages installed successfully');
+    } catch(e2) {
+      console.log('pip3 install failed, trying pip:', e2.message.substring(0,100));
+      try {
+        execSyncQ('pip install numpy Pillow scikit-image --quiet', { timeout: 300000 });
+        pythonReady = true;
+        console.log('Python packages installed via pip');
+      } catch(e3) {
+        console.log('Python packages unavailable - whiteboard will use FFmpeg fallback');
+      }
+    }
+  }
+}
+// Install asynchronously so server starts immediately
+setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
   console.log('EnerStudio Backend v7.3 running on port ' + PORT);
