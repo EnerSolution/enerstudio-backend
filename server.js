@@ -614,14 +614,30 @@ print(f'done:{total_frames}')
     const stitched = path.join(tempDir,'stitched.mp4');
     execSync('"'+ffmpegPath+'" -f concat -safe 0 -i "'+listFile+'" -c copy "'+stitched+'" -y', {timeout:120000});
 
-    // Trim or extend video to exactly match audio duration
+    // Mux audio with video — NEVER trim the video (all scenes must play)
+    // Audio plays from start and ends naturally; video continues after audio if needed
     let finalPath = stitched;
     if (audioFile && fs.existsSync(audioFile)) {
       const withAudio = path.join(tempDir,'final.mp4');
-      // Use -t audioDuration to trim video to audio length, or loop last frame if video is shorter
-      execSync('"'+ffmpegPath+'" -i "'+stitched+'" -i "'+audioFile+'" -map 0:v -map 1:a -c:v copy -c:a aac -t '+audioDuration.toFixed(2)+' "'+withAudio+'" -y', {timeout:120000});
+      // Get actual video duration
+      let videoDuration = imageUrls.length * perScene;
+      try {
+        execSync('"'+ffmpegPath+'" -i "'+stitched+'"', {timeout:10000});
+      } catch(ve) {
+        const vdm = (ve.stderr||ve.message||'').toString().match(/Duration:\s*(\d+):(\d+):([\d.]+)/);
+        if (vdm) videoDuration = parseInt(vdm[1])*3600 + parseInt(vdm[2])*60 + parseFloat(vdm[3]);
+      }
+      console.log('Video duration:', videoDuration.toFixed(2)+'s, Audio duration:', audioDuration.toFixed(2)+'s');
+      if (audioDuration > videoDuration) {
+        // Audio longer than video — trim audio to video length
+        execSync('"'+ffmpegPath+'" -i "'+stitched+'" -i "'+audioFile+'" -map 0:v -map 1:a -c:v copy -c:a aac -t '+videoDuration.toFixed(2)+' "'+withAudio+'" -y', {timeout:120000});
+        console.log('Audio trimmed to video duration');
+      } else {
+        // Video longer than audio — let video play fully, audio ends naturally
+        execSync('"'+ffmpegPath+'" -i "'+stitched+'" -i "'+audioFile+'" -map 0:v -map 1:a -c:v copy -c:a aac "'+withAudio+'" -y', {timeout:120000});
+        console.log('All scenes preserved, audio ends at:', audioDuration.toFixed(2)+'s');
+      }
       finalPath = withAudio;
-      console.log('Final video trimmed to audio duration:', audioDuration.toFixed(2)+'s');
     }
 
     // Save to outputStore (bypasses 30s HTTP timeout)
