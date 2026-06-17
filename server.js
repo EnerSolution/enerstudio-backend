@@ -21,7 +21,7 @@ app.use(express.json({ limit: '50mb' }));
 const outputStore = {}; // { videoId: { path, size, created } }
 // Cleanup files older than 30 minutes
 setInterval(() => {
-  const cutoff = Date.now() - 30 * 60 * 1000;
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000; // 24 hours
   Object.keys(outputStore).forEach(id => {
     if (outputStore[id].created < cutoff) {
       try { fs.unlinkSync(outputStore[id].path); } catch(e) {}
@@ -29,7 +29,7 @@ setInterval(() => {
       console.log('Cleaned up video:', id);
     }
   });
-}, 5 * 60 * 1000);
+}, 2 * 60 * 60 * 1000); // every 2 hours
 
 // Latest video endpoint — returns most recently saved videoId (for polling after timeout)
 app.get('/api/video/latest', (req, res) => {
