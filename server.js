@@ -71,7 +71,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.4.1',
+    version: '8.5.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -409,7 +409,6 @@ app.post('/api/runway/stitch', async (req, res) => {
 // Fallback: FFmpeg wipe reveal (if Python packages not yet installed)
 // Python packages auto-installed at server startup
 
-const HAND_B64_WB = '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';
 
 app.post('/api/whiteboard/animate', async (req, res) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enerstudio-wb-'));
@@ -572,7 +571,7 @@ print(f'done:{total_frames}')
     let finalPath = stitched;
     if (audioFile && fs.existsSync(audioFile)) {
       const withAudio = path.join(tempDir, 'final.mp4');
-      execSync('"' + ffmpegPath + '" -i "' + stitched + '" -i "' + audioFile + '" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "' + withAudio + '" -y', { timeout: 120000 });
+      execSync('"' + ffmpegPath + '" -i "' + stitched + '" -i "' + audioFile + '" -map 0:v -map 1:a -c:v copy -c:a aac "' + withAudio + '" -y', { timeout: 120000 });
       finalPath = withAudio;
     }
     const videoId = 'wb_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
@@ -798,4 +797,215 @@ app.listen(PORT, function() {
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
   console.log('ELEVENLABS_KEY:', ELEVENLABS_KEY ? 'SET' : 'MISSING');
+});// ===== WHITEBOARD v8.5.0: OUTLINE-FIRST RASTER REVEAL =====
+// Draws INK STROKES first (72% of time), then COLOR FILLS (28%)
+// Mimics natural artist drawing: sketch outline → color in
+// Professional hand PNG with pen tip precisely at reveal point
+// Duration fix: video duration matches voiceover, not -shortest
+
+const HAND_B64_WB = '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';
+
+app.post('/api/whiteboard/animate', async (req, res) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enerstudio-wb-'));
+  try {
+    const { imageUrls, voiceoverText, voiceId, secondsPerScene } = req.body;
+    if (!imageUrls || imageUrls.length === 0) {
+      return res.status(400).json({ error: 'No image URLs provided' });
+    }
+    const perScene = Math.max(6, Math.min(12, parseInt(secondsPerScene) || 8));
+    console.log('Whiteboard v8.5.0:', imageUrls.length, 'scenes x', perScene + 's, pythonReady=' + pythonReady);
+
+    const handPath = path.join(tempDir, 'hand.png');
+    fs.writeFileSync(handPath, Buffer.from(HAND_B64_WB, 'base64'));
+
+    const sceneClips = [];
+
+    for (let i = 0; i < imageUrls.length; i++) {
+      const imgPath = path.join(tempDir, 'img' + i + '.jpg');
+      const ir = await fetch(imageUrls[i]);
+      if (!ir.ok) throw new Error('Image ' + i + ' download failed: ' + ir.status);
+      fs.writeFileSync(imgPath, Buffer.from(await ir.arrayBuffer()));
+      const clip = path.join(tempDir, 'scene' + i + '.mp4');
+
+      if (pythonReady) {
+        const frameDir = path.join(tempDir, 'f' + i);
+        fs.mkdirSync(frameDir);
+        const pyScript = path.join(tempDir, 'reveal' + i + '.py');
+
+        const pyCode = `
+import numpy as np, math, os
+from PIL import Image, ImageDraw
+from skimage import measure
+
+FPS=25
+DRAW_SECS=${perScene - 1}
+HOLD_SECS=1.5
+draw_frames=int(DRAW_SECS*FPS)
+ink_frames=int(draw_frames*0.72)
+fill_frames=draw_frames-ink_frames
+hold_frames=int(HOLD_SECS*FPS)
+total_frames=draw_frames+hold_frames
+
+src=Image.open(${JSON.stringify(imgPath)}).convert('RGB')
+W,H=src.size
+arr=np.array(src)
+r2,g2,b2=arr[:,:,0].astype(int),arr[:,:,1].astype(int),arr[:,:,2].astype(int)
+gray=r2+g2+b2
+max_c=np.maximum(np.maximum(arr[:,:,0],arr[:,:,1]),arr[:,:,2]).astype(int)
+min_c=np.minimum(np.minimum(arr[:,:,0],arr[:,:,1]),arr[:,:,2]).astype(int)
+sat=max_c-min_c
+
+ink_mask=(gray<300).astype(np.uint8)
+fill_mask=((sat>30)&(gray<700)&(gray>200)).astype(np.uint8)
+
+labeled_ink=measure.label(ink_mask,connectivity=2)
+labeled_fill=measure.label(fill_mask,connectivity=2)
+ink_regs=sorted([r for r in measure.regionprops(labeled_ink) if r.area>=8],
+    key=lambda r:(int(r.centroid[0]/60),r.centroid[1]))
+fill_regs=sorted([r for r in measure.regionprops(labeled_fill) if r.area>=30],
+    key=lambda r:(int(r.centroid[0]/60),r.centroid[1]))
+
+def get_px(regs,labeled,mask):
+    result=[]
+    for reg in regs:
+        m=(labeled==reg.label)&(mask==1)
+        ys,xs=np.where(m)
+        pts=sorted(zip(ys.tolist(),xs.tolist()))
+        result.append({'pixels':[(x,y) for y,x in pts],'area':reg.area})
+    return result
+
+ink_data=get_px(ink_regs,labeled_ink,ink_mask)
+fill_data=get_px(fill_regs,labeled_fill,fill_mask)
+
+total_ink=sum(d['area'] for d in ink_data) or 1
+total_fill=sum(d['area'] for d in fill_data) or 1
+
+cum=0
+for seg in ink_data:
+    seg['start']=round(cum/total_ink*ink_frames)
+    seg['end']=seg['start']+max(2,round(seg['area']/total_ink*ink_frames))
+    cum+=seg['area']
+cum=0
+for seg in fill_data:
+    seg['start']=ink_frames+round(cum/total_fill*fill_frames)
+    seg['end']=seg['start']+max(2,round(seg['area']/total_fill*fill_frames))
+    cum+=seg['area']
+
+last_draw=max(
+    (max(s['end'] for s in ink_data) if ink_data else 0),
+    (max(s['end'] for s in fill_data) if fill_data else 0)
+)
+
+def ease(t): return 2*t*t if t<0.5 else 1-((-2*t+2)**2)/2
+
+hand=Image.open(${JSON.stringify(handPath)}).convert('RGBA')
+HAND_SIZE=int(min(W,H)*0.22)
+hand=hand.resize((HAND_SIZE,HAND_SIZE),Image.LANCZOS)
+TIP_OFFSET=int(HAND_SIZE*0.20)
+
+canvas=np.full((H,W,3),255,dtype=np.uint8)
+os.makedirs(${JSON.stringify(frameDir)},exist_ok=True)
+
+for f in range(total_frames):
+    hx,hy=None,None
+    for seg in ink_data:
+        if f<seg['start']: continue
+        pr=1.0 if f>=seg['end'] else (f-seg['start'])/max(1,seg['end']-seg['start'])
+        prog=ease(pr) if pr<1 else 1.0
+        pxl=seg['pixels']
+        n=max(1,int(len(pxl)*prog))
+        for px,py in pxl[:n]: canvas[py,px]=arr[py,px]
+        if pr<1 and pxl:
+            w=pxl[max(0,n-6):n]
+            hx=sum(p[0] for p in w)/len(w)
+            hy=sum(p[1] for p in w)/len(w)
+    for seg in fill_data:
+        if f<seg['start']: continue
+        pr=1.0 if f>=seg['end'] else (f-seg['start'])/max(1,seg['end']-seg['start'])
+        prog=ease(pr) if pr<1 else 1.0
+        pxl=seg['pixels']
+        n=max(1,int(len(pxl)*prog))
+        for px,py in pxl[:n]: canvas[py,px]=arr[py,px]
+        if pr<1 and pxl:
+            w=pxl[max(0,n-6):n]
+            hx=sum(p[0] for p in w)/len(w)
+            hy=sum(p[1] for p in w)/len(w)
+    img=Image.fromarray(canvas.copy())
+    if hx is not None and f<last_draw:
+        px_i=int(hx-TIP_OFFSET)
+        py_i=int(hy-TIP_OFFSET)
+        px_i=max(0,min(W-HAND_SIZE,px_i))
+        py_i=max(0,min(H-HAND_SIZE,py_i))
+        img_rgba=img.convert('RGBA')
+        img_rgba.paste(hand,(px_i,py_i),hand)
+        img=img_rgba.convert('RGB')
+    img.save(f'${frameDir}/fr{f:04d}.jpg',quality=95)
+print(f'done:{total_frames}')
+`;
+        fs.writeFileSync(pyScript, pyCode);
+        const { execFileSync } = require('child_process');
+        const pyOut = execFileSync('python3', [pyScript], { timeout: 600000, encoding: 'utf8' });
+        const totalFrames = parseInt((pyOut.match(/done:(\d+)/) || [,'150'])[1]);
+        execSync('"' + ffmpegPath + '" -y -framerate 25 -i "' + path.join(frameDir,'fr%04d.jpg') + '" -c:v libx264 -preset fast -crf 16 -pix_fmt yuv420p "' + clip + '"', { timeout: 300000 });
+        try { fs.rmSync(frameDir, { recursive:true, force:true }); } catch(e) {}
+        console.log('Scene', i+1, '/' + imageUrls.length, 'done (' + totalFrames + ' frames)');
+
+      } else {
+        // FFmpeg wipe fallback
+        const tr = ['wipeleft','wipedown','wiperight','wipetl'][i%4];
+        const rd = Math.min(3.5, perScene-2);
+        const fc = "[0:v]format=yuv420p[w];[1:v]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,setsar=1,format=yuv420p[im];[w][im]xfade=transition="+tr+":duration="+rd+":offset=0.3,format=yuv420p[wipe];[2:v]scale=140:140[hand];[wipe][hand]overlay=x='if(lt(t,"+rd+"),(t/"+rd+")*1100,1100)':y=270,format=yuv420p[out]";
+        execSync('"'+ffmpegPath+'" -y -f lavfi -i "color=white:s=1280x720:d='+perScene+':r=25" -loop 1 -t '+perScene+' -i "'+imgPath+'" -loop 1 -i "'+handPath+'" -filter_complex "'+fc+'" -map "[out]" -t '+perScene+' -c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p "'+clip+'"', { timeout:120000 });
+        console.log('Scene', i+1, 'FFmpeg fallback');
+      }
+      sceneClips.push(clip);
+    }
+
+    // Voiceover
+    let audioFile = null;
+    if (voiceoverText && ELEVENLABS_KEY) {
+      try {
+        let vid = voiceId || await getFirstVoice();
+        if (!vid) vid = 'EXAVITQu4vr4xnSDxMaL';
+        const cleanText = voiceoverText.replace(/\[.*?\]/g,'').replace(/SCENE.*?:\s*/gi,'').replace(/\n+/g,' ').replace(/\s+/g,' ').trim().substring(0,2000);
+        const vr = await fetch('https://api.elevenlabs.io/v1/text-to-speech/'+vid, {
+          method:'POST',
+          headers:{'xi-api-key':ELEVENLABS_KEY,'Content-Type':'application/json','Accept':'audio/mpeg'},
+          body:JSON.stringify({text:cleanText,model_id:'eleven_multilingual_v2',voice_settings:{stability:0.5,similarity_boost:0.75}})
+        });
+        if (vr.ok) { audioFile=path.join(tempDir,'voice.mp3'); fs.writeFileSync(audioFile,Buffer.from(await vr.arrayBuffer())); console.log('Voiceover ready'); }
+        else console.log('Voiceover failed:', vr.status);
+      } catch(e) { console.log('Voice error:', e.message); }
+    }
+
+    // Concat scenes
+    const listFile = path.join(tempDir,'list.txt');
+    fs.writeFileSync(listFile, sceneClips.map(f=>"file '"+f+"'").join('\n'));
+    const stitched = path.join(tempDir,'stitched.mp4');
+    execSync('"'+ffmpegPath+'" -f concat -safe 0 -i "'+listFile+'" -c copy "'+stitched+'" -y', {timeout:120000});
+
+    // Mux audio — use video duration as master (fixes duration mismatch)
+    let finalPath = stitched;
+    if (audioFile && fs.existsSync(audioFile)) {
+      const withAudio = path.join(tempDir,'final.mp4');
+      // -shortest removed: let video duration be the master, pad audio if needed
+      execSync('"'+ffmpegPath+'" -i "'+stitched+'" -i "'+audioFile+'" -map 0:v -map 1:a -c:v copy -c:a aac "'+withAudio+'" -y', {timeout:120000});
+      finalPath = withAudio;
+    }
+
+    // Save to outputStore (bypasses 30s HTTP timeout)
+    const videoId = 'wb_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+    const outputPath = path.join(os.tmpdir(), videoId+'.mp4');
+    fs.copyFileSync(finalPath, outputPath);
+    const fileSize = fs.statSync(outputPath).size;
+    outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
+    console.log('Whiteboard v8.5.0 ready:', fileSize, 'bytes, id:', videoId);
+    res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, scenes:imageUrls.length });
+
+  } catch(e) {
+    console.error('Whiteboard v8.5.0 error:', e.message);
+    res.status(500).json({ error: e.message });
+  } finally {
+    try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
+  }
 });
