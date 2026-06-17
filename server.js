@@ -637,6 +637,40 @@ print(f'done:{total_frames}')
   }
 });
 
+// ===== VOICES: ElevenLabs voice list =====
+app.get('/api/voice/list', async (req, res) => {
+  try {
+    const r = await fetch('https://api.elevenlabs.io/v2/voices?page_size=50', {
+      headers: { 'xi-api-key': ELEVENLABS_KEY }
+    });
+    const data = await r.json();
+    const voices = data.voices || data.results || [];
+    res.json({ voices: voices.map(v => ({
+      voice_id: v.voice_id,
+      name: v.name,
+      preview_url: v.preview_url,
+      labels: v.labels || {}
+    }))});
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ===== VOICE PREVIEW: proxy ElevenLabs preview audio =====
+app.get('/api/voice/preview', async (req, res) => {
+  try {
+    const { url } = req.query;
+    if (!url) return res.status(400).json({ error: 'url required' });
+    const r = await fetch(url);
+    if (!r.ok) return res.status(r.status).json({ error: 'Preview fetch failed' });
+    res.set('Content-Type', 'audio/mpeg');
+    res.send(Buffer.from(await r.arrayBuffer()));
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+
 // ===== SERVER STARTUP =====
 function ensurePythonPackages() {
   try {
