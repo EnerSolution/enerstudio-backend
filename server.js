@@ -3,11 +3,12 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execSync } = require('child_process');
+const { execSync, execFileSync } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+let pythonReady = false;
 
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const RUNWAY_KEY = process.env.RUNWAY_API_KEY;
@@ -555,7 +556,6 @@ for f in range(total_frames):
 print(f'done:{total_frames}')
 `;
         fs.writeFileSync(pyScript, pyCode);
-        const { execFileSync } = require('child_process');
         const pyOut = execFileSync('python3', [pyScript], { timeout: 600000, encoding: 'utf8' });
         const totalFrames = parseInt((pyOut.match(/done:(\d+)/) || [,'150'])[1]);
         execSync('"' + ffmpegPath + '" -y -framerate 25 -i "' + path.join(frameDir,'fr%04d.jpg') + '" -c:v libx264 -preset fast -crf 16 -pix_fmt yuv420p "' + clip + '"', { timeout: 300000 });
@@ -591,23 +591,13 @@ print(f'done:{total_frames}')
           fs.writeFileSync(audioFile,Buffer.from(await vr.arrayBuffer()));
           // Measure actual audio duration using ffprobe
           try {
-            const probe = execSync('"'+ffmpegPath+'" -i "'+audioFile+'" 2>&1; true', {encoding:'utf8', timeout:10000, shell:true});
-            const dm = probe.match(/Duration:\s*(\d+):(\d+):([\d.]+)/);
+            // ffmpeg prints duration to stderr, so we catch the error output
+            execSync('"'+ffmpegPath+'" -i "'+audioFile+'"', {timeout:10000});
+          } catch(pe) {
+            const dm = (pe.stderr||pe.message||'').toString().match(/Duration:\s*(\d+):(\d+):([\d.]+)/);
             if (dm) {
               audioDuration = parseInt(dm[1])*3600 + parseInt(dm[2])*60 + parseFloat(dm[3]);
               console.log('Audio duration:', audioDuration.toFixed(2)+'s');
-            }
-          } catch(pe) {
-            // Try alternate: ffprobe style - ffmpeg always prints duration to stderr
-            try {
-              const { execSync: es2 } = require('child_process');
-              const p2 = es2('"'+ffmpegPath+'" -i "'+audioFile+'"', {encoding:'utf8', stdio:'pipe', timeout:10000});
-            } catch(pe2) {
-              const dm2 = (pe2.stderr||pe2.message||'').match(/Duration:\s*(\d+):(\d+):([\d.]+)/);
-              if (dm2) {
-                audioDuration = parseInt(dm2[1])*3600 + parseInt(dm2[2])*60 + parseFloat(dm2[3]);
-                console.log('Audio duration (stderr):', audioDuration.toFixed(2)+'s');
-              }
             }
           }
         } else { console.log('Voiceover failed:', vr.status); }
@@ -645,4 +635,37 @@ print(f'done:{total_frames}')
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
   }
+});
+
+// ===== SERVER STARTUP =====
+function ensurePythonPackages() {
+  try {
+    execSync('python3 -c "import numpy, PIL, skimage; print(numpy.__version__)"', { timeout: 10000 });
+    pythonReady = true;
+    console.log('Python packages: numpy/PIL/skimage already available');
+  } catch(e) {
+    console.log('Installing Python packages (numpy, Pillow, scikit-image)...');
+    try {
+      execSync('pip3 install numpy Pillow scikit-image --quiet --break-system-packages', { timeout: 300000 });
+      pythonReady = true;
+      console.log('Python packages installed successfully');
+    } catch(e2) {
+      try {
+        execSync('pip install numpy Pillow scikit-image --quiet', { timeout: 300000 });
+        pythonReady = true;
+        console.log('Python packages installed via pip');
+      } catch(e3) {
+        console.log('Python packages unavailable - FFmpeg fallback will be used');
+      }
+    }
+  }
+}
+setTimeout(() => ensurePythonPackages(), 1000);
+
+app.listen(PORT, function() {
+  console.log('EnerStudio Backend v8.5.0 running on port ' + PORT);
+  console.log('FFmpeg path:', ffmpegPath);
+  console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
+  console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
+  console.log('ELEVENLABS_KEY:', ELEVENLABS_KEY ? 'SET' : 'MISSING');
 });
