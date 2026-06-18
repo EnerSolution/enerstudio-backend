@@ -72,7 +72,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.5.1',
+    version: '8.6.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -121,13 +121,14 @@ app.post('/api/runway/generate-image', async (req, res) => {
     const { prompt, styleMode } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
     
-    // For whiteboard mode: enforce ink style with strong negative prompt
+    // For whiteboard mode: put NO TEXT instruction FIRST, then style, then content
     let finalPrompt = prompt;
     if (styleMode === 'whiteboard') {
-      // Ensure prompt has strong ink enforcement
-      if (!finalPrompt.includes('no text')) {
-        finalPrompt += ', absolutely no text no words no letters, hand-drawn ink illustration only, pure white background, no photography no realistic rendering';
-      }
+      // NO TEXT must come FIRST — Runway weighs earlier instructions more heavily
+      finalPrompt = 'ZERO TEXT ZERO WORDS ZERO LETTERS ZERO NUMBERS anywhere in image. ' +
+        'Pure white background only. Professional hand-drawn ink illustration. ' +
+        'Clean confident black linework. No photography. No realistic rendering. No gradients. ' +
+        finalPrompt;
     }
     console.log('Generating image for:', finalPrompt.substring(0, 80));
 
@@ -424,11 +425,49 @@ app.post('/api/whiteboard/animate', async (req, res) => {
     if (!imageUrls || imageUrls.length === 0) {
       return res.status(400).json({ error: 'No image URLs provided' });
     }
-    const perScene = Math.max(6, Math.min(12, parseInt(secondsPerScene) || 8));
-    console.log('Whiteboard v8.5.0:', imageUrls.length, 'scenes x', perScene + 's, pythonReady=' + pythonReady);
+    const numScenes = imageUrls.length;
+    console.log('Whiteboard v8.5.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
 
     const handPath = path.join(tempDir, 'hand.png');
     fs.writeFileSync(handPath, Buffer.from(HAND_B64_WB, 'base64'));
+
+    // ── STEP 1: GENERATE VOICEOVER FIRST ──────────────────────────
+    // Audio-first architecture: measure voiceover duration, then
+    // set perScene = audioDuration / numScenes so video matches exactly
+    let audioFile = null;
+    let audioDuration = parseInt(secondsPerScene || '5') * numScenes; // fallback
+    if (voiceoverText && ELEVENLABS_KEY) {
+      try {
+        let vid = voiceId || await getFirstVoice();
+        if (!vid) vid = 'EXAVITQu4vr4xnSDxMaL';
+        const cleanText = voiceoverText.replace(/\[.*?\]/g,'').replace(/SCENE.*?:\s*/gi,'')
+          .replace(/\n+/g,' ').replace(/\s+/g,' ').trim().substring(0,2000);
+        const vr = await fetch('https://api.elevenlabs.io/v1/text-to-speech/'+vid, {
+          method:'POST',
+          headers:{'xi-api-key':ELEVENLABS_KEY,'Content-Type':'application/json','Accept':'audio/mpeg'},
+          body:JSON.stringify({text:cleanText,model_id:'eleven_multilingual_v2',voice_settings:{stability:0.5,similarity_boost:0.75}})
+        });
+        if (vr.ok) {
+          audioFile = path.join(tempDir,'voice.mp3');
+          fs.writeFileSync(audioFile, Buffer.from(await vr.arrayBuffer()));
+          // Measure actual audio duration from FFmpeg stderr
+          try {
+            execSync('"'+ffmpegPath+'" -i "'+audioFile+'"', {timeout:10000});
+          } catch(pe) {
+            const dm = (pe.stderr||pe.message||'').toString().match(/Duration:\s*(\d+):(\d+):([\d.]+)/);
+            if (dm) {
+              audioDuration = parseInt(dm[1])*3600 + parseInt(dm[2])*60 + parseFloat(dm[3]);
+              console.log('Voiceover ready, duration:', audioDuration.toFixed(2)+'s');
+            }
+          }
+        } else { console.log('Voiceover failed:', vr.status); }
+      } catch(e) { console.log('Voice error:', e.message); }
+    }
+
+    // Calculate perScene from actual audio duration — NO minimum clamp
+    // Each scene gets exactly audioDuration/numScenes seconds
+    const perScene = Math.max(4, parseFloat((audioDuration / numScenes).toFixed(2)));
+    console.log('perScene calculated:', perScene+'s ('+audioDuration.toFixed(2)+'s audio / '+numScenes+' scenes)');
 
     const sceneClips = [];
 
@@ -450,12 +489,13 @@ from PIL import Image, ImageDraw
 from skimage import measure
 
 FPS=25
-DRAW_SECS=${perScene - 0.5}
-HOLD_SECS=2.5
+# 88% of scene time for drawing, 12% for hold — ensures image completes
+DRAW_SECS=round(${perScene}*0.88, 2)
+HOLD_SECS=round(${perScene}*0.12, 2)
 draw_frames=int(DRAW_SECS*FPS)
 ink_frames=int(draw_frames*0.72)
 fill_frames=draw_frames-ink_frames
-hold_frames=int(HOLD_SECS*FPS)
+hold_frames=max(int(HOLD_SECS*FPS), 8)
 total_frames=draw_frames+hold_frames
 
 src=Image.open(${JSON.stringify(imgPath)}).convert('RGB')
@@ -577,36 +617,7 @@ print(f'done:{total_frames}')
       sceneClips.push(clip);
     }
 
-    // AUDIO-FIRST: Get voiceover, measure its duration, then set video duration to match
-    let audioFile = null;
-    let audioDuration = perScene * imageUrls.length; // fallback
-    if (voiceoverText && ELEVENLABS_KEY) {
-      try {
-        let vid = voiceId || await getFirstVoice();
-        if (!vid) vid = 'EXAVITQu4vr4xnSDxMaL';
-        const cleanText = voiceoverText.replace(/\[.*?\]/g,'').replace(/SCENE.*?:\s*/gi,'').replace(/\n+/g,' ').replace(/\s+/g,' ').trim().substring(0,2000);
-        const vr = await fetch('https://api.elevenlabs.io/v1/text-to-speech/'+vid, {
-          method:'POST',
-          headers:{'xi-api-key':ELEVENLABS_KEY,'Content-Type':'application/json','Accept':'audio/mpeg'},
-          body:JSON.stringify({text:cleanText,model_id:'eleven_multilingual_v2',voice_settings:{stability:0.5,similarity_boost:0.75}})
-        });
-        if (vr.ok) {
-          audioFile=path.join(tempDir,'voice.mp3');
-          fs.writeFileSync(audioFile,Buffer.from(await vr.arrayBuffer()));
-          // Measure actual audio duration using ffprobe
-          try {
-            // ffmpeg prints duration to stderr, so we catch the error output
-            execSync('"'+ffmpegPath+'" -i "'+audioFile+'"', {timeout:10000});
-          } catch(pe) {
-            const dm = (pe.stderr||pe.message||'').toString().match(/Duration:\s*(\d+):(\d+):([\d.]+)/);
-            if (dm) {
-              audioDuration = parseInt(dm[1])*3600 + parseInt(dm[2])*60 + parseFloat(dm[3]);
-              console.log('Audio duration:', audioDuration.toFixed(2)+'s');
-            }
-          }
-        } else { console.log('Voiceover failed:', vr.status); }
-      } catch(e) { console.log('Voice error:', e.message); }
-    }
+    // Voiceover already generated above in audio-first step
 
     // Concat scenes
     const listFile = path.join(tempDir,'list.txt');
@@ -614,29 +625,13 @@ print(f'done:{total_frames}')
     const stitched = path.join(tempDir,'stitched.mp4');
     execSync('"'+ffmpegPath+'" -f concat -safe 0 -i "'+listFile+'" -c copy "'+stitched+'" -y', {timeout:120000});
 
-    // Mux audio with video — NEVER trim the video (all scenes must play)
-    // Audio plays from start and ends naturally; video continues after audio if needed
+    // Mux pre-generated audio with video
+    // Since perScene = audioDuration/numScenes, video and audio match perfectly
     let finalPath = stitched;
     if (audioFile && fs.existsSync(audioFile)) {
       const withAudio = path.join(tempDir,'final.mp4');
-      // Get actual video duration
-      let videoDuration = imageUrls.length * perScene;
-      try {
-        execSync('"'+ffmpegPath+'" -i "'+stitched+'"', {timeout:10000});
-      } catch(ve) {
-        const vdm = (ve.stderr||ve.message||'').toString().match(/Duration:\s*(\d+):(\d+):([\d.]+)/);
-        if (vdm) videoDuration = parseInt(vdm[1])*3600 + parseInt(vdm[2])*60 + parseFloat(vdm[3]);
-      }
-      console.log('Video duration:', videoDuration.toFixed(2)+'s, Audio duration:', audioDuration.toFixed(2)+'s');
-      if (audioDuration > videoDuration) {
-        // Audio longer than video — trim audio to video length
-        execSync('"'+ffmpegPath+'" -i "'+stitched+'" -i "'+audioFile+'" -map 0:v -map 1:a -c:v copy -c:a aac -t '+videoDuration.toFixed(2)+' "'+withAudio+'" -y', {timeout:120000});
-        console.log('Audio trimmed to video duration');
-      } else {
-        // Video longer than audio — let video play fully, audio ends naturally
-        execSync('"'+ffmpegPath+'" -i "'+stitched+'" -i "'+audioFile+'" -map 0:v -map 1:a -c:v copy -c:a aac "'+withAudio+'" -y', {timeout:120000});
-        console.log('All scenes preserved, audio ends at:', audioDuration.toFixed(2)+'s');
-      }
+      execSync('"'+ffmpegPath+'" -i "'+stitched+'" -i "'+audioFile+'" -map 0:v -map 1:a -c:v copy -c:a aac "'+withAudio+'" -y', {timeout:120000});
+      console.log('Video+audio muxed. Video:', (perScene*numScenes).toFixed(2)+'s Audio:', audioDuration.toFixed(2)+'s');
       finalPath = withAudio;
     }
 
