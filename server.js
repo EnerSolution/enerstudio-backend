@@ -72,7 +72,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.9.0',
+    version: '8.10.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -426,7 +426,7 @@ app.post('/api/whiteboard/animate', async (req, res) => {
       return res.status(400).json({ error: 'No image URLs provided' });
     }
     const numScenes = imageUrls.length;
-    console.log('Whiteboard v8.9.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
+    console.log('Whiteboard v8.10.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
 
     const handPath = path.join(tempDir, 'hand.png');
     fs.writeFileSync(handPath, Buffer.from(HAND_B64_WB, 'base64'));
@@ -641,11 +641,206 @@ print(f'done:{total_frames}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Whiteboard v8.9.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Whiteboard v8.10.0 ready:', fileSize, 'bytes, id:', videoId);
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, scenes:imageUrls.length });
 
   } catch(e) {
-    console.error('Whiteboard v8.9.0 error:', e.message);
+    console.error('Whiteboard v8.10.0 error:', e.message);
+    res.status(500).json({ error: e.message });
+  } finally {
+    try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
+  }
+});
+
+// ===== ANIMATED SLIDES (Path A: code-rendered, brand-palette driven) =====
+// Two endpoints:
+//   POST /api/brand/extract-colors  -> derive a 7-slot palette from a logo (base64) or website
+//   POST /api/slides/animate        -> render designed animated slides to MP4
+
+// Helper: write a temp file from a base64 data URL or raw base64
+function writeB64(b64, p) {
+  const data = b64.includes(',') ? b64.split(',')[1] : b64;
+  fs.writeFileSync(p, Buffer.from(data, 'base64'));
+}
+
+// ---- Brand color extraction ----
+app.post('/api/brand/extract-colors', async (req, res) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enerstudio-brand-'));
+  try {
+    const { logoBase64, website } = req.body;
+    // Default palette (used if no logo and no usable website colors)
+    const DEFAULT = { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
+      accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
+
+    if (logoBase64) {
+      const logoPath = path.join(tempDir, 'logo.png');
+      writeB64(logoBase64, logoPath);
+      const py = path.join(tempDir, 'extract.py');
+      fs.writeFileSync(py, `
+import json, colorsys
+from PIL import Image
+def lum(c): r,g,b=[x/255 for x in c]; return 0.2126*r+0.7152*g+0.0722*b
+def sat(c): return colorsys.rgb_to_hsv(*[x/255 for x in c])[1]
+def hexs(c): return '#%02X%02X%02X'%tuple(int(x) for x in c)
+def mix(a,b,t): return tuple(int(a[i]+(b[i]-a[i])*t) for i in range(3))
+im=Image.open(${JSON.stringify(logoPath)}).convert('RGBA')
+bg=Image.new('RGBA',im.size,(255,255,255,255)); bg.alpha_composite(im); im=bg.convert('RGB')
+q=im.quantize(colors=8,method=Image.MEDIANCUT).convert('RGB')
+colors=q.getcolors(im.size[0]*im.size[1]); colors.sort(reverse=True)
+allc=[c for _,c in colors]
+hues=[c for _,c in colors if 0.15<lum(c)<0.92 and sat(c)>0.25]
+accent=max(hues,key=sat) if hues else max(allc,key=sat)
+others=[c for c in hues if c!=accent]
+accent2=others[0] if others else tuple(min(255,int(x*0.8)) for x in accent)
+dark=min(allc,key=lum)
+if lum(dark)>0.3:
+    h,s,v=colorsys.rgb_to_hsv(*[x/255 for x in accent]); dark=tuple(int(x*255) for x in colorsys.hsv_to_rgb(h,min(1,s+0.2),0.16))
+pal={'bg_dark':hexs(dark),'bg_mid':hexs(mix(dark,(255,255,255),0.10)),
+ 'accent':hexs(accent),'accent2':hexs(accent2),'text':'#FFFFFF',
+ 'text_soft':hexs(mix((255,255,255),accent,0.25)),'ink':hexs(dark)}
+print(json.dumps(pal))
+`);
+      const out = execFileSync('python3', [py], { timeout: 30000, encoding: 'utf8' });
+      const pal = JSON.parse(out.trim());
+      console.log('Brand colors extracted from logo:', pal.accent, pal.bg_dark);
+      return res.json({ palette: pal, source: 'logo' });
+    }
+
+    // No logo: return default (website scraping can be added later)
+    console.log('Brand colors: no logo provided, returning default palette');
+    return res.json({ palette: DEFAULT, source: 'default', website: website || null });
+  } catch (e) {
+    console.error('extract-colors error:', e.message);
+    res.status(500).json({ error: e.message });
+  } finally {
+    try { fs.rmSync(tempDir, { recursive:true, force:true }); } catch(e) {}
+  }
+});
+
+// ---- Animated Slides renderer ----
+app.post('/api/slides/animate', async (req, res) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enerstudio-slides-'));
+  try {
+    let { slides, palette, durationSecs, aspect, musicBase64 } = req.body;
+    if (!slides || !slides.length) return res.status(400).json({ error: 'No slides provided' });
+    durationSecs = Math.max(4, Math.min(120, parseInt(durationSecs || '20')));
+    const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
+      accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
+    const [W, H] = (aspect === 'vertical') ? [1080, 1920] : [1280, 720];
+    console.log('Slides v8.10.0:', slides.length, 'slides,', W+'x'+H, durationSecs+'s, pythonReady='+pythonReady);
+
+    const frameDir = path.join(tempDir, 'frames');
+    fs.mkdirSync(frameDir, { recursive:true });
+    const py = path.join(tempDir, 'slides.py');
+    fs.writeFileSync(py, `
+import os, glob, json
+from PIL import Image, ImageDraw, ImageFont
+W,H,FPS=${W},${H},30
+PAL=json.loads(${JSON.stringify(JSON.stringify(PAL))})
+SLIDES=json.loads(${JSON.stringify(JSON.stringify(slides))})
+TOTAL=${durationSecs}
+FRAME_DIR=${JSON.stringify(frameDir)}
+def ff(*names):
+    allf=glob.glob('/usr/share/fonts/**/*.ttf',recursive=True)
+    for n in names:
+        for f in allf:
+            if n.lower() in os.path.basename(f).lower(): return f
+    return allf[0] if allf else None
+FB=ff('DejaVuSans-Bold','LiberationSans-Bold','Bold')
+FR=ff('DejaVuSans','LiberationSans-Regular','Regular')
+FS=ff('DejaVuSerif-Bold','LiberationSerif-Bold','Serif')
+def font(p,s):
+    try: return ImageFont.truetype(p,max(8,int(s)))
+    except: return ImageFont.load_default()
+def ease(t): return 4*t*t*t if t<0.5 else 1-((-2*t+2)**3)/2
+def lerp(a,b,t): return a+(b-a)*t
+def hx(h):
+    h=str(h).lstrip('#')
+    if len(h)!=6: h='0B1F3A'
+    return tuple(int(h[i:i+2],16) for i in (0,2,4))
+def col(spec,key,default):
+    v=spec.get(key,default); v=PAL.get(v,v)
+    return hx(v if str(v).startswith('#') else PAL.get(default,'#FFFFFF'))
+def paint_bg(img,spec):
+    d=ImageDraw.Draw(img); kind=spec.get('type','solid')
+    if kind=='gradient':
+        c1,c2=col(spec,'from','bg_mid'),col(spec,'to','bg_dark')
+        for y in range(H):
+            t=y/H; d.line([(0,y),(W,y)],fill=tuple(int(lerp(c1[i],c2[i],t)) for i in range(3)))
+    else:
+        d.rectangle([0,0,W,H],fill=col(spec,'color','bg_dark'))
+    for sh in spec.get('shapes',[]):
+        c=col(sh,'color','accent'); x,y=int(sh.get('x',0.5)*W),int(sh.get('y',0.5)*H)
+        if sh.get('kind')=='circle':
+            r=int(sh.get('r',0.1)*W); d.ellipse([x-r,y-r,x+r,y+r],fill=c)
+        elif sh.get('kind')=='bar':
+            d.rectangle([x,y,x+int(sh.get('w',0.2)*W),y+int(sh.get('h',0.02)*H)],fill=c)
+def draw_block(base,blk,prog):
+    txt=str(blk.get('text','')); REF=min(W,H); size=int(blk.get('size',0.08)*REF)
+    c=col(blk,'color','text'); fp={'bold':FB,'serif':FS}.get(blk.get('weight'),FR)
+    anim=blk.get('anim','fade'); shown=txt
+    if anim=='type': shown=txt[:max(0,int(len(txt)*prog))]
+    f=font(fp,size)
+    layer=Image.new('RGBA',(W,H),(0,0,0,0)); ld=ImageDraw.Draw(layer)
+    maxw=int(W*0.86); bb=ld.textbbox((0,0),txt or ' ',font=f)
+    while (bb[2]-bb[0])>maxw and size>10:
+        size=int(size*0.92); f=font(fp,size); bb=ld.textbbox((0,0),txt or ' ',font=f)
+    bb=ld.textbbox((0,0),shown or ' ',font=f); tw,th=bb[2]-bb[0],bb[3]-bb[1]
+    cx,cy=int(blk.get('x',0.5)*W),int(blk.get('y',0.5)*H); align=blk.get('align','center')
+    x=cx-tw//2 if align=='center' else (cx if align=='left' else cx-tw); y=cy-th//2
+    e=ease(min(1,prog)) if anim!='type' else 1.0; dx=dy=0; a=1.0
+    if anim=='fade': a=e
+    elif anim=='rise': dy=int(lerp(0.05*H,0,e)); a=e
+    elif anim=='slide': dx=int(lerp(-0.06*W,0,e)); a=e
+    elif anim=='pop':
+        f=font(fp,max(8,int(size*lerp(0.6,1,e)))); a=e
+        bb=ld.textbbox((0,0),shown or ' ',font=f); tw,th=bb[2]-bb[0],bb[3]-bb[1]; x=cx-tw//2; y=cy-th//2
+    ld.text((x+dx-bb[0],y+dy-bb[1]),shown,font=f,fill=c+(int(255*a),))
+    base.alpha_composite(layer)
+os.makedirs(FRAME_DIR,exist_ok=True)
+fps_per=max(1,int((TOTAL*FPS)/len(SLIDES))); idx=0
+for spec in SLIDES:
+    intro=int(fps_per*0.35)
+    for lf in range(fps_per):
+        img=Image.new('RGBA',(W,H),(0,0,0,255)); paint_bg(img,spec.get('bg',{}))
+        for ln in spec.get('lines',[]):
+            d=ImageDraw.Draw(img); lp=min(1,lf/max(1,intro))
+            x1,y1=int(ln.get('x1',0.1)*W),int(ln.get('y1',0.5)*H)
+            x2=int(lerp(ln.get('x1',0.1),ln.get('x2',0.4),ease(lp))*W); y2=int(lerp(ln.get('y1',0.5),ln.get('y2',0.5),ease(lp))*H)
+            d.line([x1,y1,x2,y2],fill=col(ln,'color','accent'),width=max(2,int(ln.get('w',0.008)*W)))
+        for blk in spec.get('blocks',[]):
+            delay=blk.get('delay',0); span=max(1,intro*(1-delay)); prog=max(0,min(1,(lf-intro*delay)/span))
+            draw_block(img,blk,prog)
+        img.convert('RGB').save(f'{FRAME_DIR}/fr{idx:05d}.jpg',quality=92); idx+=1
+print(f'done:{idx}')
+`);
+    execFileSync('python3', [py], { timeout: 600000, encoding: 'utf8' });
+    const silent = path.join(tempDir, 'slides.mp4');
+    execSync('"'+ffmpegPath+'" -y -framerate 30 -i "'+path.join(frameDir,'fr%05d.jpg')+'" -c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p "'+silent+'"', { timeout:300000 });
+
+    // Optional background music
+    let finalPath = silent;
+    if (musicBase64) {
+      try {
+        const musicPath = path.join(tempDir, 'music.mp3');
+        writeB64(musicBase64, musicPath);
+        const withMusic = path.join(tempDir, 'final.mp4');
+        execSync('"'+ffmpegPath+'" -i "'+silent+'" -i "'+musicPath+'" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "'+withMusic+'" -y', { timeout:120000 });
+        finalPath = withMusic;
+        console.log('Slides: background music muxed');
+      } catch(e) { console.log('Slides: music mux failed, using silent:', e.message); }
+    }
+
+    const videoId = 'sl_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+    const outputPath = path.join(os.tmpdir(), videoId+'.mp4');
+    fs.copyFileSync(finalPath, outputPath);
+    const fileSize = fs.statSync(outputPath).size;
+    outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
+    console.log('Slides v8.10.0 ready:', fileSize, 'bytes, id:', videoId);
+    res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length });
+
+  } catch(e) {
+    console.error('Slides v8.10.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -712,7 +907,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.9.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.10.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
