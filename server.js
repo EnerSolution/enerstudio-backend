@@ -72,7 +72,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.10.0',
+    version: '8.11.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -426,7 +426,7 @@ app.post('/api/whiteboard/animate', async (req, res) => {
       return res.status(400).json({ error: 'No image URLs provided' });
     }
     const numScenes = imageUrls.length;
-    console.log('Whiteboard v8.10.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
+    console.log('Whiteboard v8.11.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
 
     const handPath = path.join(tempDir, 'hand.png');
     fs.writeFileSync(handPath, Buffer.from(HAND_B64_WB, 'base64'));
@@ -641,11 +641,11 @@ print(f'done:{total_frames}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Whiteboard v8.10.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Whiteboard v8.11.0 ready:', fileSize, 'bytes, id:', videoId);
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, scenes:imageUrls.length });
 
   } catch(e) {
-    console.error('Whiteboard v8.10.0 error:', e.message);
+    console.error('Whiteboard v8.11.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -721,13 +721,55 @@ print(json.dumps(pal))
 app.post('/api/slides/animate', async (req, res) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enerstudio-slides-'));
   try {
-    let { slides, palette, durationSecs, aspect, musicBase64 } = req.body;
+    let { slides, palette, durationSecs, aspect, musicBase64, musicTrack, audioMode, voiceId, voiceSync } = req.body;
     if (!slides || !slides.length) return res.status(400).json({ error: 'No slides provided' });
     durationSecs = Math.max(4, Math.min(120, parseInt(durationSecs || '20')));
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : [1280, 720];
-    console.log('Slides v8.10.0:', slides.length, 'slides,', W+'x'+H, durationSecs+'s, pythonReady='+pythonReady);
+    console.log('Slides v8.11.0:', slides.length, 'slides,', W+'x'+H, audioMode||'music', 'pythonReady='+pythonReady);
+
+    // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
+    let audioFile = null;
+    let perSlideSecs = null; // array of seconds per slide when voice-synced
+    if (audioMode === 'voice' && voiceSync && ELEVENLABS_KEY) {
+      try {
+        let vid = voiceId || await getFirstVoice();
+        if (!vid) vid = 'EXAVITQu4vr4xnSDxMaL';
+        const partFiles = [];
+        perSlideSecs = [];
+        for (let i = 0; i < slides.length; i++) {
+          const vt = (slides[i].voiceText || (slides[i].blocks||[]).map(b=>b.text).join('. ') || 'slide').toString().substring(0,300);
+          const vr = await fetch('https://api.elevenlabs.io/v1/text-to-speech/'+vid, {
+            method:'POST',
+            headers:{'xi-api-key':ELEVENLABS_KEY,'Content-Type':'application/json'},
+            body:JSON.stringify({ text: vt, model_id:'eleven_turbo_v2', voice_settings:{stability:0.5,similarity_boost:0.75} })
+          });
+          if (!vr.ok) throw new Error('TTS failed '+vr.status);
+          const buf = Buffer.from(await vr.arrayBuffer());
+          const pf = path.join(tempDir, 'v'+i+'.mp3');
+          fs.writeFileSync(pf, buf);
+          // measure duration
+          let dur = 3.0;
+          try {
+            const probe = execSync('"'+ffmpegPath.replace('ffmpeg','ffprobe')+'" -v error -show_entries format=duration -of default=nk=1:nw=1 "'+pf+'"', {encoding:'utf8'}).trim();
+            if (probe && !isNaN(parseFloat(probe))) dur = parseFloat(probe) + 0.4; // small pause
+          } catch(e) { /* fallback dur */ }
+          perSlideSecs.push(dur);
+          partFiles.push(pf);
+        }
+        // concat all voice parts into one track
+        const listFile = path.join(tempDir, 'concat.txt');
+        fs.writeFileSync(listFile, partFiles.map(f=>"file '"+f+"'").join('\n'));
+        audioFile = path.join(tempDir, 'voice.mp3');
+        execSync('"'+ffmpegPath+'" -y -f concat -safe 0 -i "'+listFile+'" -c copy "'+audioFile+'"', {timeout:120000});
+        durationSecs = perSlideSecs.reduce((a,b)=>a+b, 0);
+        console.log('Voice-synced: per-slide secs', perSlideSecs.map(s=>s.toFixed(1)).join(','), 'total', durationSecs.toFixed(1));
+      } catch(e) {
+        console.log('Voice generation failed, falling back to timed slides:', e.message);
+        audioFile = null; perSlideSecs = null;
+      }
+    }
 
     const frameDir = path.join(tempDir, 'frames');
     fs.mkdirSync(frameDir, { recursive:true });
@@ -739,6 +781,7 @@ W,H,FPS=${W},${H},30
 PAL=json.loads(${JSON.stringify(JSON.stringify(PAL))})
 SLIDES=json.loads(${JSON.stringify(JSON.stringify(slides))})
 TOTAL=${durationSecs}
+PER_SLIDE=json.loads(${JSON.stringify(JSON.stringify(perSlideSecs))})
 FRAME_DIR=${JSON.stringify(frameDir)}
 def ff(*names):
     allf=glob.glob('/usr/share/fonts/**/*.ttf',recursive=True)
@@ -761,20 +804,26 @@ def hx(h):
 def col(spec,key,default):
     v=spec.get(key,default); v=PAL.get(v,v)
     return hx(v if str(v).startswith('#') else PAL.get(default,'#FFFFFF'))
-def paint_bg(img,spec):
+def paint_bg(img,spec,t):
     d=ImageDraw.Draw(img); kind=spec.get('type','solid')
     if kind=='gradient':
         c1,c2=col(spec,'from','bg_mid'),col(spec,'to','bg_dark')
         for y in range(H):
-            t=y/H; d.line([(0,y),(W,y)],fill=tuple(int(lerp(c1[i],c2[i],t)) for i in range(3)))
+            ty=y/H; d.line([(0,y),(W,y)],fill=tuple(int(lerp(c1[i],c2[i],ty)) for i in range(3)))
     else:
         d.rectangle([0,0,W,H],fill=col(spec,'color','bg_dark'))
     for sh in spec.get('shapes',[]):
-        c=col(sh,'color','accent'); x,y=int(sh.get('x',0.5)*W),int(sh.get('y',0.5)*H)
+        c=col(sh,'color','accent'); anim=sh.get('anim','fade')
+        e=ease(min(1,t*2.0))  # shapes settle in first half
+        x,y=sh.get('x',0.5),sh.get('y',0.5)
+        if anim=='drift': x=lerp(x-0.04,x,e)
+        scale=lerp(0.4,1.0,e) if anim=='grow' else 1.0
+        layer=Image.new('RGBA',(W,H),(0,0,0,0)); ld=ImageDraw.Draw(layer)
         if sh.get('kind')=='circle':
-            r=int(sh.get('r',0.1)*W); d.ellipse([x-r,y-r,x+r,y+r],fill=c)
+            r=int(sh.get('r',0.1)*W*scale); cx,cy=int(x*W),int(y*H); ld.ellipse([cx-r,cy-r,cx+r,cy+r],fill=c+(220,))
         elif sh.get('kind')=='bar':
-            d.rectangle([x,y,x+int(sh.get('w',0.2)*W),y+int(sh.get('h',0.02)*H)],fill=c)
+            bx,by=int(x*W),int(y*H); ld.rectangle([bx,by,bx+int(sh.get('w',0.2)*W*scale),by+int(sh.get('h',0.02)*H)],fill=c+(220,))
+        img.alpha_composite(layer)
 def draw_block(base,blk,prog):
     txt=str(blk.get('text','')); REF=min(W,H); size=int(blk.get('size',0.08)*REF)
     c=col(blk,'color','text'); fp={'bold':FB,'serif':FS}.get(blk.get('weight'),FR)
@@ -792,17 +841,27 @@ def draw_block(base,blk,prog):
     if anim=='fade': a=e
     elif anim=='rise': dy=int(lerp(0.05*H,0,e)); a=e
     elif anim=='slide': dx=int(lerp(-0.06*W,0,e)); a=e
+    elif anim=='dropin': dy=int(lerp(-0.08*H,0,e)); a=e
+    elif anim=='zoom':
+        f=font(fp,max(8,int(size*lerp(1.4,1.0,e)))); a=e
+        bb=ld.textbbox((0,0),shown or ' ',font=f); tw,th=bb[2]-bb[0],bb[3]-bb[1]; x=cx-tw//2 if align=='center' else (cx if align=='left' else cx-tw); y=cy-th//2
     elif anim=='pop':
         f=font(fp,max(8,int(size*lerp(0.6,1,e)))); a=e
-        bb=ld.textbbox((0,0),shown or ' ',font=f); tw,th=bb[2]-bb[0],bb[3]-bb[1]; x=cx-tw//2; y=cy-th//2
+        bb=ld.textbbox((0,0),shown or ' ',font=f); tw,th=bb[2]-bb[0],bb[3]-bb[1]; x=cx-tw//2 if align=='center' else (cx if align=='left' else cx-tw); y=cy-th//2
     ld.text((x+dx-bb[0],y+dy-bb[1]),shown,font=f,fill=c+(int(255*a),))
     base.alpha_composite(layer)
 os.makedirs(FRAME_DIR,exist_ok=True)
-fps_per=max(1,int((TOTAL*FPS)/len(SLIDES))); idx=0
-for spec in SLIDES:
-    intro=int(fps_per*0.35)
-    for lf in range(fps_per):
-        img=Image.new('RGBA',(W,H),(0,0,0,255)); paint_bg(img,spec.get('bg',{}))
+# Per-slide frame counts: use voice durations if present, else equal split
+if PER_SLIDE:
+    slide_frames=[max(1,int(s*FPS)) for s in PER_SLIDE]
+else:
+    fp_each=max(1,int((TOTAL*FPS)/len(SLIDES))); slide_frames=[fp_each]*len(SLIDES)
+idx=0
+for si,spec in enumerate(SLIDES):
+    fcount=slide_frames[si]; intro=max(1,int(fcount*0.35))
+    for lf in range(fcount):
+        t=lf/max(1,fcount)
+        img=Image.new('RGBA',(W,H),(0,0,0,255)); paint_bg(img,spec.get('bg',{}),t)
         for ln in spec.get('lines',[]):
             d=ImageDraw.Draw(img); lp=min(1,lf/max(1,intro))
             x1,y1=int(ln.get('x1',0.1)*W),int(ln.get('y1',0.5)*H)
@@ -818,17 +877,26 @@ print(f'done:{idx}')
     const silent = path.join(tempDir, 'slides.mp4');
     execSync('"'+ffmpegPath+'" -y -framerate 30 -i "'+path.join(frameDir,'fr%05d.jpg')+'" -c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p "'+silent+'"', { timeout:300000 });
 
-    // Optional background music
+    // ── Audio muxing ──
     let finalPath = silent;
-    if (musicBase64) {
+    let muxAudio = null;
+    if (audioMode === 'voice' && audioFile && fs.existsSync(audioFile)) {
+      muxAudio = audioFile;
+    } else if (musicBase64) {
+      try { const mp = path.join(tempDir,'music_up'); writeB64(musicBase64, mp); muxAudio = mp; } catch(e){}
+    } else if (musicTrack) {
+      // Starter tracks: look in /opt/render/project/src/music/<track>.mp3 (uploaded by you later)
+      const candidate = path.join(__dirname, 'music', musicTrack + '.mp3');
+      if (fs.existsSync(candidate)) muxAudio = candidate;
+      else console.log('Starter track not found (add music/'+musicTrack+'.mp3 later):', candidate);
+    }
+    if (muxAudio) {
       try {
-        const musicPath = path.join(tempDir, 'music.mp3');
-        writeB64(musicBase64, musicPath);
-        const withMusic = path.join(tempDir, 'final.mp4');
-        execSync('"'+ffmpegPath+'" -i "'+silent+'" -i "'+musicPath+'" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "'+withMusic+'" -y', { timeout:120000 });
-        finalPath = withMusic;
-        console.log('Slides: background music muxed');
-      } catch(e) { console.log('Slides: music mux failed, using silent:', e.message); }
+        const withAudio = path.join(tempDir, 'final.mp4');
+        execSync('"'+ffmpegPath+'" -i "'+silent+'" -i "'+muxAudio+'" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "'+withAudio+'" -y', { timeout:120000 });
+        finalPath = withAudio;
+        console.log('Slides: audio muxed ('+(audioMode==='voice'?'voiceover':'music')+')');
+      } catch(e) { console.log('Slides: audio mux failed, using silent:', e.message); }
     }
 
     const videoId = 'sl_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
@@ -836,11 +904,11 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.10.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.11.0 ready:', fileSize, 'bytes, id:', videoId);
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length });
 
   } catch(e) {
-    console.error('Slides v8.10.0 error:', e.message);
+    console.error('Slides v8.11.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -907,7 +975,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.10.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.11.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
