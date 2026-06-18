@@ -72,7 +72,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.11.0',
+    version: '8.12.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -426,7 +426,7 @@ app.post('/api/whiteboard/animate', async (req, res) => {
       return res.status(400).json({ error: 'No image URLs provided' });
     }
     const numScenes = imageUrls.length;
-    console.log('Whiteboard v8.11.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
+    console.log('Whiteboard v8.12.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
 
     const handPath = path.join(tempDir, 'hand.png');
     fs.writeFileSync(handPath, Buffer.from(HAND_B64_WB, 'base64'));
@@ -641,11 +641,11 @@ print(f'done:{total_frames}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Whiteboard v8.11.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Whiteboard v8.12.0 ready:', fileSize, 'bytes, id:', videoId);
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, scenes:imageUrls.length });
 
   } catch(e) {
-    console.error('Whiteboard v8.11.0 error:', e.message);
+    console.error('Whiteboard v8.12.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -727,7 +727,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : [1280, 720];
-    console.log('Slides v8.11.0:', slides.length, 'slides,', W+'x'+H, audioMode||'music', 'pythonReady='+pythonReady);
+    console.log('Slides v8.12.0:', slides.length, 'slides,', W+'x'+H, audioMode||'music', 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -736,8 +736,10 @@ app.post('/api/slides/animate', async (req, res) => {
       try {
         let vid = voiceId || await getFirstVoice();
         if (!vid) vid = 'EXAVITQu4vr4xnSDxMaL';
-        const partFiles = [];
+        const wavFiles = [];
         perSlideSecs = [];
+        const ffprobePath = ffmpegPath.replace(/ffmpeg(\.exe)?$/, 'ffprobe$1');
+        const PAUSE = 0.6; // seconds of silence appended after each slide's narration
         for (let i = 0; i < slides.length; i++) {
           const vt = (slides[i].voiceText || (slides[i].blocks||[]).map(b=>b.text).join('. ') || 'slide').toString().substring(0,300);
           const vr = await fetch('https://api.elevenlabs.io/v1/text-to-speech/'+vid, {
@@ -746,25 +748,30 @@ app.post('/api/slides/animate', async (req, res) => {
             body:JSON.stringify({ text: vt, model_id:'eleven_turbo_v2', voice_settings:{stability:0.5,similarity_boost:0.75} })
           });
           if (!vr.ok) throw new Error('TTS failed '+vr.status);
-          const buf = Buffer.from(await vr.arrayBuffer());
-          const pf = path.join(tempDir, 'v'+i+'.mp3');
-          fs.writeFileSync(pf, buf);
-          // measure duration
+          const mp3 = path.join(tempDir, 'v'+i+'.mp3');
+          fs.writeFileSync(mp3, Buffer.from(await vr.arrayBuffer()));
+          // Decode MP3 -> WAV at fixed rate AND append exact silence, in one pass.
+          // WAV is sample-accurate so concat + measured duration agree perfectly.
+          const wav = path.join(tempDir, 'v'+i+'.wav');
+          execSync('"'+ffmpegPath+'" -y -i "'+mp3+'" -af "apad=pad_dur='+PAUSE+'" -ar 44100 -ac 2 "'+wav+'"', {timeout:120000});
+          // Measure the ACTUAL wav duration (this is exactly what will play)
           let dur = 3.0;
           try {
-            const probe = execSync('"'+ffmpegPath.replace('ffmpeg','ffprobe')+'" -v error -show_entries format=duration -of default=nk=1:nw=1 "'+pf+'"', {encoding:'utf8'}).trim();
-            if (probe && !isNaN(parseFloat(probe))) dur = parseFloat(probe) + 0.4; // small pause
-          } catch(e) { /* fallback dur */ }
+            const probe = execSync('"'+ffprobePath+'" -v error -show_entries format=duration -of default=nk=1:nw=1 "'+wav+'"', {encoding:'utf8'}).trim();
+            if (probe && !isNaN(parseFloat(probe))) dur = parseFloat(probe);
+          } catch(e) {}
           perSlideSecs.push(dur);
-          partFiles.push(pf);
+          wavFiles.push(wav);
         }
-        // concat all voice parts into one track
+        // Concatenate WAVs losslessly (sample-accurate), then encode AAC once.
         const listFile = path.join(tempDir, 'concat.txt');
-        fs.writeFileSync(listFile, partFiles.map(f=>"file '"+f+"'").join('\n'));
-        audioFile = path.join(tempDir, 'voice.mp3');
-        execSync('"'+ffmpegPath+'" -y -f concat -safe 0 -i "'+listFile+'" -c copy "'+audioFile+'"', {timeout:120000});
+        fs.writeFileSync(listFile, wavFiles.map(f=>"file '"+f+"'").join('\n'));
+        const joinedWav = path.join(tempDir, 'voice_joined.wav');
+        execSync('"'+ffmpegPath+'" -y -f concat -safe 0 -i "'+listFile+'" -c copy "'+joinedWav+'"', {timeout:120000});
+        audioFile = path.join(tempDir, 'voice.m4a');
+        execSync('"'+ffmpegPath+'" -y -i "'+joinedWav+'" -c:a aac -b:a 192k "'+audioFile+'"', {timeout:120000});
         durationSecs = perSlideSecs.reduce((a,b)=>a+b, 0);
-        console.log('Voice-synced: per-slide secs', perSlideSecs.map(s=>s.toFixed(1)).join(','), 'total', durationSecs.toFixed(1));
+        console.log('Voice-synced: per-slide secs', perSlideSecs.map(s=>s.toFixed(2)).join(','), 'total', durationSecs.toFixed(2));
       } catch(e) {
         console.log('Voice generation failed, falling back to timed slides:', e.message);
         audioFile = null; perSlideSecs = null;
@@ -893,7 +900,14 @@ print(f'done:{idx}')
     if (muxAudio) {
       try {
         const withAudio = path.join(tempDir, 'final.mp4');
-        execSync('"'+ffmpegPath+'" -i "'+silent+'" -i "'+muxAudio+'" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "'+withAudio+'" -y', { timeout:120000 });
+        if (audioMode === 'voice') {
+          // Video and voice are derived from identical durations; mux without cutting.
+          // -shortest is safe here because both are ~equal; tpad guards against rounding.
+          execSync('"'+ffmpegPath+'" -i "'+silent+'" -i "'+muxAudio+'" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "'+withAudio+'" -y', { timeout:120000 });
+        } else {
+          // Music: loop/trim music to the video length (video is the master).
+          execSync('"'+ffmpegPath+'" -i "'+silent+'" -stream_loop -1 -i "'+muxAudio+'" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "'+withAudio+'" -y', { timeout:120000 });
+        }
         finalPath = withAudio;
         console.log('Slides: audio muxed ('+(audioMode==='voice'?'voiceover':'music')+')');
       } catch(e) { console.log('Slides: audio mux failed, using silent:', e.message); }
@@ -904,11 +918,11 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.11.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.12.0 ready:', fileSize, 'bytes, id:', videoId);
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length });
 
   } catch(e) {
-    console.error('Slides v8.11.0 error:', e.message);
+    console.error('Slides v8.12.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -975,7 +989,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.11.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.12.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
