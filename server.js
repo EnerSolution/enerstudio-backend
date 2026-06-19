@@ -72,7 +72,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.23.0',
+    version: '8.24.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -426,7 +426,7 @@ app.post('/api/whiteboard/animate', async (req, res) => {
       return res.status(400).json({ error: 'No image URLs provided' });
     }
     const numScenes = imageUrls.length;
-    console.log('Whiteboard v8.23.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
+    console.log('Whiteboard v8.24.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
 
     const handPath = path.join(tempDir, 'hand.png');
     fs.writeFileSync(handPath, Buffer.from(HAND_B64_WB, 'base64'));
@@ -641,11 +641,11 @@ print(f'done:{total_frames}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Whiteboard v8.23.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Whiteboard v8.24.0 ready:', fileSize, 'bytes, id:', videoId);
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, scenes:imageUrls.length });
 
   } catch(e) {
-    console.error('Whiteboard v8.23.0 error:', e.message);
+    console.error('Whiteboard v8.24.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -727,7 +727,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.23.0:', slides.length, 'slides,', W+'x'+H, audioMode||'music', 'pythonReady='+pythonReady);
+    console.log('Slides v8.24.0:', slides.length, 'slides,', W+'x'+H, audioMode||'music', 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -812,6 +812,8 @@ def hx(h):
 def col(spec,key,default):
     v=spec.get(key,default); v=PAL.get(v,v)
     return hx(v if str(v).startswith('#') else PAL.get(default,'#FFFFFF'))
+def lum_rgb(c):
+    return (0.2126*c[0]+0.7152*c[1]+0.0722*c[2])/255.0
 def vgrad(d,c1,c2):
     for y in range(H):
         ty=y/H; d.line([(0,y),(W,y)],fill=tuple(int(lerp(c1[i],c2[i],ty)) for i in range(3)))
@@ -879,6 +881,18 @@ def paint_bg(img,spec,t):
 def draw_block(base,blk,prog):
     txt=str(blk.get('text','')); REF=min(W,H); size=int(blk.get('size',0.08)*REF)
     c=col(blk,'color','text'); fp={'bold':FB,'serif':FS}.get(blk.get('weight'),FR)
+    # ── Contrast guard: sample the background under this text; if text & bg are both
+    #    dark or both light, swap text to a readable color so it's never invisible. ──
+    try:
+        sx,sy=int(blk.get('x',0.5)*W), int(blk.get('y',0.5)*H)
+        region=base.crop((max(0,sx-60),max(0,sy-30),min(W,sx+60),min(H,sy+30))).convert('RGB')
+        region=region.resize((8,8))
+        px=list(region.getdata()); n=max(1,len(px))
+        avg=(sum(p[0] for p in px)/n, sum(p[1] for p in px)/n, sum(p[2] for p in px)/n)
+        bg_l=lum_rgb(avg); txt_l=lum_rgb(c)
+        if abs(bg_l-txt_l) < 0.35:   # too little contrast
+            c = (255,255,255) if bg_l < 0.5 else (15,15,15)
+    except: pass
     anim=blk.get('anim','fade'); shown=txt
     if anim=='type': shown=txt[:max(0,int(len(txt)*prog))]
     f=font(fp,size)
@@ -1006,20 +1020,22 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.23.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.24.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
     let videoData = null;
     try {
-      if (fileSize < 25 * 1024 * 1024) { // under 25MB → safe to inline
+      if (fileSize < 8 * 1024 * 1024) { // under 8MB → safe to inline without breaking fetch/JSON
         videoData = 'data:video/mp4;base64,' + fs.readFileSync(outputPath).toString('base64');
+      } else {
+        console.log('Video too large to inline ('+fileSize+'B) — client will use URL fallback');
       }
     } catch(e) { console.log('Inline encode skipped:', e.message); }
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.23.0 error:', e.message);
+    console.error('Slides v8.24.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -1086,7 +1102,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.23.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.24.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
