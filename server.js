@@ -72,7 +72,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.15.0',
+    version: '8.16.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -426,7 +426,7 @@ app.post('/api/whiteboard/animate', async (req, res) => {
       return res.status(400).json({ error: 'No image URLs provided' });
     }
     const numScenes = imageUrls.length;
-    console.log('Whiteboard v8.15.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
+    console.log('Whiteboard v8.16.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
 
     const handPath = path.join(tempDir, 'hand.png');
     fs.writeFileSync(handPath, Buffer.from(HAND_B64_WB, 'base64'));
@@ -641,11 +641,11 @@ print(f'done:{total_frames}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Whiteboard v8.15.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Whiteboard v8.16.0 ready:', fileSize, 'bytes, id:', videoId);
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, scenes:imageUrls.length });
 
   } catch(e) {
-    console.error('Whiteboard v8.15.0 error:', e.message);
+    console.error('Whiteboard v8.16.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -727,7 +727,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : [1280, 720];
-    console.log('Slides v8.15.0:', slides.length, 'slides,', W+'x'+H, audioMode||'music', 'pythonReady='+pythonReady);
+    console.log('Slides v8.16.0:', slides.length, 'slides,', W+'x'+H, audioMode||'music', 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -783,7 +783,7 @@ app.post('/api/slides/animate', async (req, res) => {
     fs.mkdirSync(frameDir, { recursive:true });
     const py = path.join(tempDir, 'slides.py');
     fs.writeFileSync(py, `
-import os, glob, json
+import os, glob, json, math
 from PIL import Image, ImageDraw, ImageFont
 W,H,FPS=${W},${H},30
 PAL=json.loads(${JSON.stringify(JSON.stringify(PAL))})
@@ -812,25 +812,56 @@ def hx(h):
 def col(spec,key,default):
     v=spec.get(key,default); v=PAL.get(v,v)
     return hx(v if str(v).startswith('#') else PAL.get(default,'#FFFFFF'))
+def vgrad(d,c1,c2):
+    for y in range(H):
+        ty=y/H; d.line([(0,y),(W,y)],fill=tuple(int(lerp(c1[i],c2[i],ty)) for i in range(3)))
+def hgrad(d,c1,c2):
+    for x in range(0,W,2):
+        tx=x/W; d.line([(x,0),(x,H)],fill=tuple(int(lerp(c1[i],c2[i],tx)) for i in range(3)),width=2)
 def paint_bg(img,spec,t):
     d=ImageDraw.Draw(img); kind=spec.get('type','solid')
     if kind=='gradient':
         c1,c2=col(spec,'from','bg_mid'),col(spec,'to','bg_dark')
-        for y in range(H):
-            ty=y/H; d.line([(0,y),(W,y)],fill=tuple(int(lerp(c1[i],c2[i],ty)) for i in range(3)))
+        if spec.get('dir')=='horizontal': hgrad(d,c1,c2)
+        else: vgrad(d,c1,c2)
+    elif kind=='split':
+        # solid base + a large color block on one side (modern, professional)
+        base=col(spec,'color','bg_dark'); block=col(spec,'block','bg_mid')
+        d.rectangle([0,0,W,H],fill=base)
+        side=spec.get('side','left'); frac=spec.get('frac',0.38)
+        if side=='left': d.rectangle([0,0,int(W*frac),H],fill=block)
+        elif side=='right': d.rectangle([int(W*(1-frac)),0,W,H],fill=block)
+        elif side=='top': d.rectangle([0,0,W,int(H*frac)],fill=block)
+        else: d.rectangle([0,int(H*(1-frac)),W,H],fill=block)
+    elif kind=='diagonal':
+        base=col(spec,'color','bg_dark'); block=col(spec,'block','bg_mid')
+        d.rectangle([0,0,W,H],fill=base)
+        d.polygon([(0,H),(W,0),(W,H)],fill=block)
     else:
         d.rectangle([0,0,W,H],fill=col(spec,'color','bg_dark'))
-    for sh in spec.get('shapes',[]):
-        c=col(sh,'color','accent'); anim=sh.get('anim','fade')
-        e=ease(min(1,t*2.0))  # shapes settle in first half
-        x,y=sh.get('x',0.5),sh.get('y',0.5)
-        if anim=='drift': x=lerp(x-0.04,x,e)
-        scale=lerp(0.4,1.0,e) if anim=='grow' else 1.0
+    # ── shapes: bold entrance (first 35%) THEN continuous subtle drift/float entire slide ──
+    for si,sh in enumerate(spec.get('shapes',[])):
+        c=col(sh,'color','accent'); anim=sh.get('anim','float')
+        e=ease(min(1.0, t/0.35))            # entrance progress (settles by 35%)
+        bx,by=sh.get('x',0.5),sh.get('y',0.5)
+        x,y=bx,by; scale=1.0
+        # entrance
+        if anim=='slidein': x=lerp(bx-0.12, bx, e)
+        elif anim=='grow':  scale=lerp(0.3,1.0,e)
+        elif anim=='dropin':y=lerp(by-0.12, by, e)
+        # continuous drift for the WHOLE slide (gentle sine float, phase offset per shape)
+        ph=si*1.7
+        x += 0.012*math.sin(2*math.pi*(t*0.6)+ph)
+        y += 0.018*math.cos(2*math.pi*(t*0.5)+ph)
+        op=int(210*min(1.0,e+0.1))
         layer=Image.new('RGBA',(W,H),(0,0,0,0)); ld=ImageDraw.Draw(layer)
         if sh.get('kind')=='circle':
-            r=int(sh.get('r',0.1)*W*scale); cx,cy=int(x*W),int(y*H); ld.ellipse([cx-r,cy-r,cx+r,cy+r],fill=c+(220,))
+            r=int(sh.get('r',0.1)*W*scale); cx,cy=int(x*W),int(y*H); ld.ellipse([cx-r,cy-r,cx+r,cy+r],fill=c+(op,))
+        elif sh.get('kind')=='ring':
+            r=int(sh.get('r',0.1)*W*scale); cx,cy=int(x*W),int(y*H); wd=max(4,int(r*0.16))
+            ld.ellipse([cx-r,cy-r,cx+r,cy+r],outline=c+(op,),width=wd)
         elif sh.get('kind')=='bar':
-            bx,by=int(x*W),int(y*H); ld.rectangle([bx,by,bx+int(sh.get('w',0.2)*W*scale),by+int(sh.get('h',0.02)*H)],fill=c+(220,))
+            bxp,byp=int(x*W),int(y*H); ld.rectangle([bxp,byp,bxp+int(sh.get('w',0.2)*W*scale),byp+int(sh.get('h',0.02)*H)],fill=c+(op,))
         img.alpha_composite(layer)
 def draw_block(base,blk,prog):
     txt=str(blk.get('text','')); REF=min(W,H); size=int(blk.get('size',0.08)*REF)
@@ -923,7 +954,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.15.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.16.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -936,7 +967,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.15.0 error:', e.message);
+    console.error('Slides v8.16.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -1003,7 +1034,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.15.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.16.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
