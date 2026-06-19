@@ -153,7 +153,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.51.0',
+    version: '8.52.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -252,8 +252,10 @@ app.post('/api/runway/generate-image', async (req, res) => {
 
 app.post('/api/runway/generate', async (req, res) => {
   try {
-    const { prompt, imageUrl } = req.body;
+    const { prompt, imageUrl, ratio, duration } = req.body;
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
+    const vidRatio = ratio || '1280:720';
+    const vidDur = duration || 5;
 
     // If imageUrl provided, use directly (handles both URLs and base64)
     if (imageUrl) {
@@ -278,8 +280,8 @@ app.post('/api/runway/generate', async (req, res) => {
           model: 'gen4_turbo',
           promptImage: finalImageUrl,
           promptText: prompt + ', smooth cinematic camera movement',
-          duration: 5,
-          ratio: '1280:720'
+          duration: vidDur,
+          ratio: vidRatio
         })
       });
       const vidData = await vidRes.json();
@@ -929,6 +931,122 @@ app.get('/api/heygen/status/:id', async (req, res) => {
   }
 });
 
+// ---- Product Ad finalize: overlay captions + price + music onto a Runway video ----
+app.post('/api/productad/finalize', async (req, res) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enerstudio-prodad-'));
+  try {
+    let { videoUrl, headline, sub, price, palette, aspect, musicTrack } = req.body;
+    if (!videoUrl) return res.status(400).json({ error: 'videoUrl required' });
+    const PAL = palette || { bg_dark:'#0B1F3A', accent:'#F4B400', text:'#FFFFFF', text_soft:'#FCD9A8' };
+    const dim = (aspect === 'vertical') ? { W:1080, H:1920 } : (aspect === 'square') ? { W:1080, H:1080 } : { W:1280, H:720 };
+    const W = dim.W, H = dim.H;
+
+    // 1) download the Runway video
+    const srcPath = path.join(tempDir, 'src.mp4');
+    const vr = await fetch(videoUrl);
+    if (!vr.ok) throw new Error('Could not download Runway video');
+    fs.writeFileSync(srcPath, Buffer.from(await vr.arrayBuffer()));
+
+    // 2) build a caption overlay PNG (headline + sub at bottom, price pill)
+    const ovPath = path.join(tempDir, 'ov.png');
+    const ovPy = path.join(tempDir, 'ov.py');
+    fs.writeFileSync(ovPy, `
+import glob, os
+from PIL import Image, ImageDraw, ImageFont
+W,H=${W},${H}
+def hx(h):
+    h=str(h).lstrip('#')
+    if len(h)!=6: h='FFFFFF'
+    return tuple(int(h[i:i+2],16) for i in (0,2,4))
+ACC=hx(${JSON.stringify(PAL.accent || '#F4B400')})
+TX=hx(${JSON.stringify(PAL.text || '#FFFFFF')})
+HEAD=${JSON.stringify(headline || '')}
+SUB=${JSON.stringify(sub || '')}
+PRICE=${JSON.stringify(price || '')}
+def ff(*names):
+    allf=glob.glob('/usr/share/fonts/**/*.ttf',recursive=True)
+    for n in names:
+        for f in allf:
+            if n.lower() in os.path.basename(f).lower(): return f
+    return allf[0] if allf else None
+FB=ff('DejaVuSans-Bold','Bold'); FR=ff('DejaVuSans','Regular')
+def font(p,s):
+    try: return ImageFont.truetype(p,max(8,int(s)))
+    except: return ImageFont.load_default()
+img=Image.new('RGBA',(W,H),(0,0,0,0)); d=ImageDraw.Draw(img)
+def wrap(text,fnt,maxw):
+    words=text.split(); lines=[]; cur=''
+    for w in words:
+        t=(cur+' '+w).strip()
+        if d.textlength(t,font=fnt)<=maxw: cur=t
+        else:
+            if cur: lines.append(cur)
+            cur=w
+    if cur: lines.append(cur)
+    return lines
+short=(H if H>=W else W)
+hfs=int(short*0.072); sfs=int(short*0.040); pfs=int(short*0.075)
+fh=font(FB,hfs); fs_=font(FR,sfs); fp=font(FB,pfs)
+# layout from bottom up
+y=int(H*0.80)
+if HEAD:
+    for ln in wrap(HEAD,fh,int(W*0.86)):
+        tw=d.textlength(ln,font=fh); x=(W-tw)/2; pad=hfs*0.30
+        d.rectangle([x-pad,y-pad*0.4,x+tw+pad,y+hfs*1.2],fill=(0,0,0,180))
+        d.text((x+2,y+2),ln,font=fh,fill=(0,0,0,230)); d.text((x,y),ln,font=fh,fill=TX+(255,))
+        y+=hfs*1.35
+if SUB:
+    y+=int(short*0.01)
+    for ln in wrap(SUB,fs_,int(W*0.82)):
+        tw=d.textlength(ln,font=fs_); x=(W-tw)/2; pad=sfs*0.3
+        d.rectangle([x-pad,y-pad*0.4,x+tw+pad,y+sfs*1.2],fill=(0,0,0,160))
+        d.text((x,y),ln,font=fs_,fill=hx(${JSON.stringify(PAL.text_soft || '#FCD9A8')})+(255,))
+        y+=sfs*1.3
+if PRICE:
+    y+=int(short*0.012)
+    tw=d.textlength(PRICE,font=fp); x=(W-tw)/2; pad=pfs*0.36
+    d.rectangle([x-pad,y-pad*0.4,x+tw+pad,y+pfs*1.2],fill=ACC+(240,))
+    d.text((x,y),PRICE,font=fp,fill=(15,18,30,255))
+img.save(${JSON.stringify(ovPath)})
+print('ov ok')
+`);
+    execSync('python3 "' + ovPy + '"', { timeout: 60000 });
+
+    // 3) scale/crop runway video to target aspect, overlay captions
+    const vf = "scale=" + W + ":" + H + ":force_original_aspect_ratio=increase,crop=" + W + ":" + H + ",setsar=1";
+    const composed = path.join(tempDir, 'composed.mp4');
+    execSync('"' + ffmpegPath + '" -y -i "' + srcPath + '" -i "' + ovPath + '" -filter_complex "[0:v]' + vf + '[bg];[bg][1:v]overlay=0:0:format=auto,format=yuv420p[out]" -map "[out]" -map 0:a? -r 30 -c:v libx264 -preset ultrafast -threads 1 -x264-params "rc-lookahead=10:sync-lookahead=0:bframes=0:ref=1:sliced-threads=0" -crf 22 -pix_fmt yuv420p "' + composed + '"', { timeout: 180000 });
+
+    // 4) add music if requested
+    let finalV = composed;
+    let musicPath = null;
+    if (musicTrack) {
+      const cand = [path.join(__dirname, musicTrack + '.mp3'), path.join(__dirname, 'music', musicTrack + '.mp3')];
+      musicPath = cand.find(p => { try { return fs.existsSync(p); } catch(e){ return false; } }) || null;
+    }
+    if (musicPath) {
+      const withA = path.join(tempDir, 'final.mp4');
+      execSync('"' + ffmpegPath + '" -y -stream_loop -1 -i "' + musicPath + '" -i "' + composed + '" -map 1:v -map 0:a -c:v copy -c:a aac -b:a 192k -shortest "' + withA + '" -y', { timeout: 120000 });
+      finalV = withA;
+    }
+
+    // 5) store + return
+    const vid = 'vid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    const finalPath = path.join(os.tmpdir(), vid + '.mp4');
+    fs.copyFileSync(finalV, finalPath);
+    const sz = fs.statSync(finalPath).size;
+    outputStore[vid] = { path: finalPath, size: sz, created: Date.now() };
+    let videoData = null;
+    if (sz < 20 * 1024 * 1024) videoData = 'data:video/mp4;base64,' + fs.readFileSync(finalPath).toString('base64');
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(e) {}
+    console.log('Product Ad (Runway) finalized', vid, Math.round(sz/1024) + 'KB');
+    res.json({ videoId: vid, size: sz, videoData });
+  } catch (e) {
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(_e) {}
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---- Stock footage preview: returns candidate clips per scene for review/replace ----
 app.post('/api/stock/preview', async (req, res) => {
   try {
@@ -959,7 +1077,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.51.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.52.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -1592,7 +1710,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.51.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.52.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -1607,7 +1725,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.51.0 error:', e.message);
+    console.error('Slides v8.52.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -1674,7 +1792,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.51.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.52.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
