@@ -14,6 +14,7 @@ const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const RUNWAY_KEY = process.env.RUNWAY_API_KEY;
 const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY;
 const PEXELS_KEY = process.env.PEXELS_API_KEY;
+const HEYGEN_KEY = process.env.HEYGEN_API_KEY;
 
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '50mb' }));
@@ -152,7 +153,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.39.0',
+    version: '8.40.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -798,6 +799,104 @@ print(json.dumps(pal))
   }
 });
 
+// ════════════════ HEYGEN TALKING AVATAR (Option A) ════════════════
+// List avatars from the connected HeyGen account
+app.get('/api/heygen/avatars', async (req, res) => {
+  if (!HEYGEN_KEY) return res.json({ configured: false, avatars: [] });
+  try {
+    const r = await fetch('https://api.heygen.com/v2/avatars', {
+      headers: { 'X-Api-Key': HEYGEN_KEY, 'Accept': 'application/json' }
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      return res.status(502).json({ error: 'HeyGen avatars failed (' + r.status + ')', detail: t.slice(0, 200) });
+    }
+    const data = await r.json();
+    const raw = (data && data.data && data.data.avatars) || [];
+    const avatars = raw.map(a => ({
+      id: a.avatar_id,
+      name: a.avatar_name || a.avatar_id,
+      gender: (a.gender || 'unknown').toLowerCase(),
+      photo: a.preview_image_url || null,
+      previewVideo: a.preview_video_url || null,
+      premium: !!a.premium
+    })).filter(a => a.photo);
+    res.json({ configured: true, count: avatars.length, avatars });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Start a talking-avatar video generation
+app.post('/api/heygen/generate', async (req, res) => {
+  if (!HEYGEN_KEY) return res.status(400).json({ error: 'HeyGen not configured' });
+  try {
+    let { avatarId, script, voiceId, aspect } = req.body;
+    if (!avatarId || !script) return res.status(400).json({ error: 'avatarId and script are required' });
+    // dimensions by aspect
+    const dim = (aspect === 'vertical') ? { width: 720, height: 1280 }
+              : (aspect === 'square') ? { width: 1080, height: 1080 }
+              : { width: 1280, height: 720 };
+    // Build voice settings: use an ElevenLabs-style HeyGen voice if provided, else HeyGen default text-to-speech
+    const voiceSettings = voiceId
+      ? { type: 'text', input_text: script, voice_id: voiceId }
+      : { type: 'text', input_text: script, voice_id: '1bd001e7e50f421d891986aad5158bc8' }; // HeyGen default
+    const body = {
+      video_inputs: [{
+        character: { type: 'avatar', avatar_id: avatarId, avatar_style: 'normal' },
+        voice: voiceSettings,
+        background: { type: 'color', value: '#0B1F3A' }
+      }],
+      dimension: dim
+    };
+    const r = await fetch('https://api.heygen.com/v2/video/generate', {
+      method: 'POST',
+      headers: { 'X-Api-Key': HEYGEN_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const data = await r.json();
+    if (!r.ok || !(data && data.data && data.data.video_id)) {
+      return res.status(502).json({ error: 'HeyGen generate failed', detail: JSON.stringify(data).slice(0, 300) });
+    }
+    res.json({ videoId: data.data.video_id });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Poll generation status; when done, download the MP4 and return inline (if small) + a local id
+app.get('/api/heygen/status/:id', async (req, res) => {
+  if (!HEYGEN_KEY) return res.status(400).json({ error: 'HeyGen not configured' });
+  try {
+    const r = await fetch('https://api.heygen.com/v1/video_status.get?video_id=' + encodeURIComponent(req.params.id), {
+      headers: { 'X-Api-Key': HEYGEN_KEY }
+    });
+    const data = await r.json();
+    const d = (data && data.data) || {};
+    const status = d.status || 'unknown';
+    if (status === 'completed' && d.video_url) {
+      // download and store so the client gets a stable URL + optional inline
+      try {
+        const vr = await fetch(d.video_url);
+        const buf = Buffer.from(await vr.arrayBuffer());
+        const vid = 'vid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+        const fp = path.join(os.tmpdir(), vid + '.mp4');
+        fs.writeFileSync(fp, buf);
+        outputStore[vid] = { path: fp, size: buf.length, created: Date.now() };
+        let videoData = null;
+        if (buf.length < 20 * 1024 * 1024) videoData = 'data:video/mp4;base64,' + buf.toString('base64');
+        return res.json({ status: 'completed', videoId: vid, size: buf.length, videoData, heygenUrl: d.video_url });
+      } catch (dlErr) {
+        return res.json({ status: 'completed', heygenUrl: d.video_url, error: 'local store failed' });
+      }
+    }
+    if (status === 'failed') return res.json({ status: 'failed', error: (d.error && d.error.message) || 'generation failed' });
+    res.json({ status: status }); // processing | pending | waiting
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---- Stock footage preview: returns candidate clips per scene for review/replace ----
 app.post('/api/stock/preview', async (req, res) => {
   try {
@@ -828,7 +927,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.39.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.40.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -1300,7 +1399,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.39.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.40.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -1315,7 +1414,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.39.0 error:', e.message);
+    console.error('Slides v8.40.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -1382,7 +1481,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.39.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.40.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
