@@ -72,7 +72,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.22.0',
+    version: '8.23.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -426,7 +426,7 @@ app.post('/api/whiteboard/animate', async (req, res) => {
       return res.status(400).json({ error: 'No image URLs provided' });
     }
     const numScenes = imageUrls.length;
-    console.log('Whiteboard v8.22.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
+    console.log('Whiteboard v8.23.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
 
     const handPath = path.join(tempDir, 'hand.png');
     fs.writeFileSync(handPath, Buffer.from(HAND_B64_WB, 'base64'));
@@ -641,11 +641,11 @@ print(f'done:{total_frames}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Whiteboard v8.22.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Whiteboard v8.23.0 ready:', fileSize, 'bytes, id:', videoId);
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, scenes:imageUrls.length });
 
   } catch(e) {
-    console.error('Whiteboard v8.22.0 error:', e.message);
+    console.error('Whiteboard v8.23.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -727,7 +727,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.22.0:', slides.length, 'slides,', W+'x'+H, audioMode||'music', 'pythonReady='+pythonReady);
+    console.log('Slides v8.23.0:', slides.length, 'slides,', W+'x'+H, audioMode||'music', 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -784,7 +784,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const py = path.join(tempDir, 'slides.py');
     fs.writeFileSync(py, `
 import os, glob, json, math
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 W,H,FPS=${W},${H},30
 PAL=json.loads(${JSON.stringify(JSON.stringify(PAL))})
 SLIDES=json.loads(${JSON.stringify(JSON.stringify(slides))})
@@ -870,6 +870,11 @@ def paint_bg(img,spec,t):
             ld.ellipse([cx-r,cy-r,cx+r,cy+r],outline=c+(op,),width=wd)
         elif sh.get('kind')=='bar':
             bxp,byp=int(x*W),int(y*H); ld.rectangle([bxp,byp,bxp+int(sh.get('w',0.2)*W*scale),byp+int(sh.get('h',0.02)*H)],fill=c+(op,))
+        # soft glow: blurred copy of the shape behind it for a richer, 3D feel
+        try:
+            glow=layer.filter(ImageFilter.GaussianBlur(int(min(W,H)*0.012)))
+            img.alpha_composite(glow)
+        except: pass
         img.alpha_composite(layer)
 def draw_block(base,blk,prog):
     txt=str(blk.get('text','')); REF=min(W,H); size=int(blk.get('size',0.08)*REF)
@@ -895,15 +900,23 @@ def draw_block(base,blk,prog):
     elif anim=='pop':
         f=font(fp,max(8,int(size*lerp(0.6,1,e)))); a=e
         bb=ld.textbbox((0,0),shown or ' ',font=f); tw,th=bb[2]-bb[0],bb[3]-bb[1]; x=cx-tw//2 if align=='center' else (cx if align=='left' else cx-tw); y=cy-th//2
+    # drop shadow for depth (offset dark copy behind the text)
+    sh_off=max(2,int(REF*0.006))
+    ld.text((x+dx-bb[0]+sh_off, y+dy-bb[1]+sh_off), shown, font=f, fill=(0,0,0,int(150*a)))
     ld.text((x+dx-bb[0],y+dy-bb[1]),shown,font=f,fill=c+(int(255*a),))
     # ── subtle dark backing panel behind text for guaranteed readability over shapes ──
     if a>0.05 and (bb[2]-bb[0])>0:
         fbb=ld.textbbox((0,0),txt or ' ',font=f); fw,fh=fbb[2]-fbb[0],fbb[3]-fbb[1]
         fx=cx-fw//2 if align=='center' else (cx if align=='left' else cx-fw)
-        padx,pady=int(REF*0.03),int(REF*0.025)
+        padx,pady=int(REF*0.035),int(REF*0.03)
         panel=Image.new('RGBA',(W,H),(0,0,0,0)); pdr=ImageDraw.Draw(panel)
+        # soft shadow under the panel, then the panel itself (gives a floating 3D card look)
+        pdr.rounded_rectangle([fx+dx-padx+sh_off*2, (cy-fh//2)+dy-pady+sh_off*2, fx+dx+fw+padx+sh_off*2, (cy-fh//2)+dy+fh+pady+sh_off*2],
+                             radius=int(REF*0.025), fill=(0,0,0,int(45*a)))
         pdr.rounded_rectangle([fx+dx-padx, (cy-fh//2)+dy-pady, fx+dx+fw+padx, (cy-fh//2)+dy+fh+pady],
-                             radius=int(REF*0.02), fill=(0,0,0,int(70*a)))
+                             radius=int(REF*0.025), fill=(0,0,0,int(85*a)))
+        try: panel=panel.filter(ImageFilter.GaussianBlur(1.5))
+        except: pass
         base.alpha_composite(panel)   # panel first (behind)
     base.alpha_composite(layer)        # text on top
 os.makedirs(FRAME_DIR,exist_ok=True)
@@ -993,7 +1006,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.22.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.23.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -1006,7 +1019,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.22.0 error:', e.message);
+    console.error('Slides v8.23.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -1073,7 +1086,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.22.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.23.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
