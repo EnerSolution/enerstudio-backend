@@ -72,7 +72,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.13.0',
+    version: '8.14.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -426,7 +426,7 @@ app.post('/api/whiteboard/animate', async (req, res) => {
       return res.status(400).json({ error: 'No image URLs provided' });
     }
     const numScenes = imageUrls.length;
-    console.log('Whiteboard v8.13.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
+    console.log('Whiteboard v8.14.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
 
     const handPath = path.join(tempDir, 'hand.png');
     fs.writeFileSync(handPath, Buffer.from(HAND_B64_WB, 'base64'));
@@ -641,11 +641,11 @@ print(f'done:{total_frames}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Whiteboard v8.13.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Whiteboard v8.14.0 ready:', fileSize, 'bytes, id:', videoId);
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, scenes:imageUrls.length });
 
   } catch(e) {
-    console.error('Whiteboard v8.13.0 error:', e.message);
+    console.error('Whiteboard v8.14.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -727,7 +727,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : [1280, 720];
-    console.log('Slides v8.13.0:', slides.length, 'slides,', W+'x'+H, audioMode||'music', 'pythonReady='+pythonReady);
+    console.log('Slides v8.14.0:', slides.length, 'slides,', W+'x'+H, audioMode||'music', 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -862,6 +862,9 @@ os.makedirs(FRAME_DIR,exist_ok=True)
 # Per-slide frame counts: use voice durations if present, else equal split
 if PER_SLIDE:
     slide_frames=[max(1,int(round(s*FPS))) for s in PER_SLIDE]
+    # Add a small tail to the LAST slide so the video always slightly outlasts the
+    # audio (prevents -shortest from clipping the final word). Cheap: just more frames.
+    slide_frames[-1]=slide_frames[-1]+int(0.5*FPS)
 else:
     fp_each=max(1,int((TOTAL*FPS)/len(SLIDES))); slide_frames=[fp_each]*len(SLIDES)
 idx=0
@@ -883,7 +886,7 @@ print(f'done:{idx}')
 `);
     execFileSync('python3', [py], { timeout: 600000, encoding: 'utf8' });
     const silent = path.join(tempDir, 'slides.mp4');
-    execSync('"'+ffmpegPath+'" -y -framerate 30 -i "'+path.join(frameDir,'fr%05d.jpg')+'" -c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p "'+silent+'"', { timeout:300000 });
+    execSync('"'+ffmpegPath+'" -y -framerate 30 -i "'+path.join(frameDir,'fr%05d.jpg')+'" -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p "'+silent+'"', { timeout:300000 });
 
     // ── Audio muxing ──
     let finalPath = silent;
@@ -902,10 +905,10 @@ print(f'done:{idx}')
       try {
         const withAudio = path.join(tempDir, 'final.mp4');
         if (audioMode === 'voice') {
-          // Video frames ≈ audio length, but rounding can leave video a hair short.
-          // tpad clones the final frame to cover any gap so the full voice always plays,
-          // then -shortest trims to the audio end. Nothing gets cut off.
-          execSync('"'+ffmpegPath+'" -i "'+silent+'" -i "'+muxAudio+'" -filter_complex "[0:v]tpad=stop_mode=clone:stop_duration=2[v]" -map "[v]" -map 1:a -c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p -c:a aac -shortest "'+withAudio+'" -y', { timeout:300000 });
+          // Video frames already match the voice length to within a frame.
+          // Stream-COPY the video (no re-encode) and just add the audio — fast & light.
+          // -shortest trims the ~0.01s rounding tail; nothing meaningful is lost.
+          execSync('"'+ffmpegPath+'" -i "'+silent+'" -i "'+muxAudio+'" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "'+withAudio+'" -y', { timeout:120000 });
         } else {
           // Music: loop/trim music to the video length (video is the master).
           execSync('"'+ffmpegPath+'" -i "'+silent+'" -stream_loop -1 -i "'+muxAudio+'" -map 0:v -map 1:a -c:v copy -c:a aac -shortest "'+withAudio+'" -y', { timeout:120000 });
@@ -920,11 +923,11 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.13.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.14.0 ready:', fileSize, 'bytes, id:', videoId);
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length });
 
   } catch(e) {
-    console.error('Slides v8.13.0 error:', e.message);
+    console.error('Slides v8.14.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -991,7 +994,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.13.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.14.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
