@@ -109,7 +109,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.34.0',
+    version: '8.35.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -765,7 +765,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.34.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.35.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -881,26 +881,33 @@ def wrap(d,text,fnt,maxw):
 for idx,s in enumerate(SLIDES):
     img=Image.new('RGBA',(W,H),(0,0,0,0))
     d=ImageDraw.Draw(img)
+    # Build all blocks first (wrapped), then stack them as ONE centered group so they never overlap
+    blocks=[]
     for b in s.get('blocks',[]):
-        txt=b.get('text',''); 
+        txt=b.get('text','')
         if not txt: continue
         size=b.get('size',0.08); fs=max(20,int(size*(W if H>W else H)))
         weight=b.get('weight','bold')
         fnt=font(FB if weight=='bold' else FR, fs)
-        cx=b.get('x',0.5)*W; cy=b.get('y',0.5)*H
-        lines=wrap(d,txt,fnt,int(W*0.86))
-        lh=fs*1.25; total=lh*len(lines)
-        y=cy-total/2
+        lines=wrap(d,txt,fnt,int(W*0.82))
+        lh=fs*1.25
         c=col(b,'color','text')
-        for ln in lines:
-            tw=d.textlength(ln,font=fnt); x=cx-tw/2
-            # readable dark panel behind text
-            pad=fs*0.28
-            d.rectangle([x-pad,y-pad*0.4,x+tw+pad,y+lh-pad*0.2],fill=(0,0,0,120))
-            # drop shadow
-            d.text((x+2,y+2),ln,font=fnt,fill=(0,0,0,200))
-            d.text((x,y),ln,font=fnt,fill=c+(255,))
-            y+=lh
+        blocks.append({'lines':lines,'fnt':fnt,'fs':fs,'lh':lh,'c':c,'h':lh*len(lines)})
+    if blocks:
+        gap=int((H if H>=W else W)*0.03)  # space between blocks
+        group_h=sum(bl['h'] for bl in blocks)+gap*(len(blocks)-1)
+        # center the whole group vertically around 0.46 of the frame (slightly above middle)
+        y=int(H*0.46)-group_h/2
+        for bl in blocks:
+            for ln in bl['lines']:
+                fnt=bl['fnt']; fs=bl['fs']; lh=bl['lh']
+                tw=d.textlength(ln,font=fnt); x=(W-tw)/2
+                pad=fs*0.28
+                d.rectangle([x-pad,y-pad*0.4,x+tw+pad,y+lh-pad*0.2],fill=(0,0,0,140))
+                d.text((x+2,y+2),ln,font=fnt,fill=(0,0,0,210))
+                d.text((x,y),ln,font=fnt,fill=bl['c']+(255,))
+                y+=lh
+            y+=gap
     img.save(os.path.join(OV,'ov%02d.png'%idx))
 print('overlays',len(SLIDES))
 `);
@@ -956,7 +963,7 @@ print('overlays',len(SLIDES))
         const sz = fs.statSync(finalPath).size;
         outputStore[vid] = { path: finalPath, size: sz, created: Date.now() };
         let videoData = null;
-        if (sz < 8 * 1024 * 1024) {
+        if (sz < 20 * 1024 * 1024) {
           videoData = 'data:video/mp4;base64,' + fs.readFileSync(finalPath).toString('base64');
         }
         try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(e) {}
@@ -1224,7 +1231,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.34.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.35.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -1239,7 +1246,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.34.0 error:', e.message);
+    console.error('Slides v8.35.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -1306,7 +1313,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.34.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.35.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
