@@ -72,7 +72,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.24.0',
+    version: '8.25.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -426,7 +426,7 @@ app.post('/api/whiteboard/animate', async (req, res) => {
       return res.status(400).json({ error: 'No image URLs provided' });
     }
     const numScenes = imageUrls.length;
-    console.log('Whiteboard v8.24.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
+    console.log('Whiteboard v8.25.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
 
     const handPath = path.join(tempDir, 'hand.png');
     fs.writeFileSync(handPath, Buffer.from(HAND_B64_WB, 'base64'));
@@ -641,11 +641,11 @@ print(f'done:{total_frames}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Whiteboard v8.24.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Whiteboard v8.25.0 ready:', fileSize, 'bytes, id:', videoId);
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, scenes:imageUrls.length });
 
   } catch(e) {
-    console.error('Whiteboard v8.24.0 error:', e.message);
+    console.error('Whiteboard v8.25.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -727,7 +727,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.24.0:', slides.length, 'slides,', W+'x'+H, audioMode||'music', 'pythonReady='+pythonReady);
+    console.log('Slides v8.25.0:', slides.length, 'slides,', W+'x'+H, audioMode||'music', 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -872,27 +872,36 @@ def paint_bg(img,spec,t):
             ld.ellipse([cx-r,cy-r,cx+r,cy+r],outline=c+(op,),width=wd)
         elif sh.get('kind')=='bar':
             bxp,byp=int(x*W),int(y*H); ld.rectangle([bxp,byp,bxp+int(sh.get('w',0.2)*W*scale),byp+int(sh.get('h',0.02)*H)],fill=c+(op,))
-        # soft glow: blurred copy of the shape behind it for a richer, 3D feel
-        try:
-            glow=layer.filter(ImageFilter.GaussianBlur(int(min(W,H)*0.012)))
-            img.alpha_composite(glow)
-        except: pass
         img.alpha_composite(layer)
+def bg_lum_at(spec, fx, fy):
+    # Estimate background brightness at a point WITHOUT reading pixels (fast).
+    kind=spec.get('type','solid')
+    if kind=='gradient':
+        c1=col(spec,'from','bg_mid'); c2=col(spec,'to','bg_dark')
+        tt = fy if spec.get('dir')!='horizontal' else fx
+        mix=tuple(c1[i]+(c2[i]-c1[i])*tt for i in range(3))
+        return lum_rgb(mix)
+    if kind=='split':
+        side=spec.get('side','left'); frac=spec.get('frac',0.38)
+        inblock = (side=='left' and fx<frac) or (side=='right' and fx>1-frac) or (side=='top' and fy<frac) or (side=='bottom' and fy>1-frac)
+        return lum_rgb(col(spec,'block','bg_mid')) if inblock else lum_rgb(col(spec,'color','bg_dark'))
+    if kind=='diagonal':
+        # block fills lower-right triangle (x+y > 1-ish); approximate
+        return lum_rgb(col(spec,'block','bg_mid')) if (fx+fy)>1.0 else lum_rgb(col(spec,'color','bg_dark'))
+    return lum_rgb(col(spec,'color','bg_dark'))
+def fix_contrast(blocks, spec):
+    # Decide each block's final text color ONCE (not per frame) for speed + readability.
+    for b in blocks:
+        c=col(b,'color','text')
+        bl=bg_lum_at(spec, b.get('x',0.5), b.get('y',0.5))
+        if abs(bl - lum_rgb(c)) < 0.35:
+            b['_forceColor'] = '#FFFFFF' if bl < 0.5 else '#0F0F0F'
+    return blocks
 def draw_block(base,blk,prog):
     txt=str(blk.get('text','')); REF=min(W,H); size=int(blk.get('size',0.08)*REF)
-    c=col(blk,'color','text'); fp={'bold':FB,'serif':FS}.get(blk.get('weight'),FR)
-    # ── Contrast guard: sample the background under this text; if text & bg are both
-    #    dark or both light, swap text to a readable color so it's never invisible. ──
-    try:
-        sx,sy=int(blk.get('x',0.5)*W), int(blk.get('y',0.5)*H)
-        region=base.crop((max(0,sx-60),max(0,sy-30),min(W,sx+60),min(H,sy+30))).convert('RGB')
-        region=region.resize((8,8))
-        px=list(region.getdata()); n=max(1,len(px))
-        avg=(sum(p[0] for p in px)/n, sum(p[1] for p in px)/n, sum(p[2] for p in px)/n)
-        bg_l=lum_rgb(avg); txt_l=lum_rgb(c)
-        if abs(bg_l-txt_l) < 0.35:   # too little contrast
-            c = (255,255,255) if bg_l < 0.5 else (15,15,15)
-    except: pass
+    if blk.get('_forceColor'): c=hx(blk['_forceColor'])
+    else: c=col(blk,'color','text')
+    fp={'bold':FB,'serif':FS}.get(blk.get('weight'),FR)
     anim=blk.get('anim','fade'); shown=txt
     if anim=='type': shown=txt[:max(0,int(len(txt)*prog))]
     f=font(fp,size)
@@ -929,8 +938,6 @@ def draw_block(base,blk,prog):
                              radius=int(REF*0.025), fill=(0,0,0,int(45*a)))
         pdr.rounded_rectangle([fx+dx-padx, (cy-fh//2)+dy-pady, fx+dx+fw+padx, (cy-fh//2)+dy+fh+pady],
                              radius=int(REF*0.025), fill=(0,0,0,int(85*a)))
-        try: panel=panel.filter(ImageFilter.GaussianBlur(1.5))
-        except: pass
         base.alpha_composite(panel)   # panel first (behind)
     base.alpha_composite(layer)        # text on top
 os.makedirs(FRAME_DIR,exist_ok=True)
@@ -961,6 +968,7 @@ def space_blocks(blocks):
     return blocks
 for si,spec in enumerate(SLIDES):
     spec['blocks']=space_blocks(spec.get('blocks',[]))
+    spec['blocks']=fix_contrast(spec['blocks'], spec.get('bg',{}))
     fcount=slide_frames[si]; intro=max(1,int(fcount*0.35))
     for lf in range(fcount):
         t=lf/max(1,fcount)
@@ -1020,7 +1028,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.24.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.25.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -1035,7 +1043,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.24.0 error:', e.message);
+    console.error('Slides v8.25.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -1102,7 +1110,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.24.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.25.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
