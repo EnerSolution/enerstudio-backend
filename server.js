@@ -34,31 +34,31 @@ setInterval(() => {
 
 // ── PEXELS STOCK VIDEO FETCH (brand-agnostic; uses each scene's own query) ──
 // Returns a local file path to a downloaded clip, or null on any failure.
-async function fetchPexelsClip(query, orientation, tempDir, idx) {
-  if (!PEXELS_KEY || !query) return null;
+async function fetchPexelsClip(query, orientation, tempDir, idx, directUrl) {
+  if (!PEXELS_KEY) return null;
   try {
-    const url = 'https://api.pexels.com/videos/search?query=' + encodeURIComponent(query)
-      + '&per_page=5&orientation=' + (orientation || 'landscape');
-    const r = await fetch(url, { headers: { Authorization: PEXELS_KEY } });
-    if (!r.ok) { console.log('Pexels search failed', r.status, 'for', query); return null; }
-    const data = await r.json();
-    const videos = (data && data.videos) || [];
-    if (!videos.length) { console.log('Pexels no results for', query); return null; }
-    // Pick the first video; choose a reasonably sized file (prefer ~hd, <1080 wide to save memory)
-    let best = null;
-    for (const v of videos) {
-      const files = (v.video_files || []).slice().sort((a,b)=> (a.width||0)-(b.width||0));
-      // prefer a file between 640 and 1280 wide
-      let pick = files.find(f => (f.width||0) >= 720 && (f.width||0) <= 1280) || files[0];
-      if (pick && pick.link) { best = pick.link; break; }
+    let best = directUrl || null;
+    if (!best) {
+      if (!query) return null;
+      const url = 'https://api.pexels.com/videos/search?query=' + encodeURIComponent(query)
+        + '&per_page=5&orientation=' + (orientation || 'landscape');
+      const r = await fetch(url, { headers: { Authorization: PEXELS_KEY } });
+      if (!r.ok) { console.log('Pexels search failed', r.status, 'for', query); return null; }
+      const data = await r.json();
+      const videos = (data && data.videos) || [];
+      if (!videos.length) { console.log('Pexels no results for', query); return null; }
+      for (const v of videos) {
+        const files = (v.video_files || []).slice().sort((a,b)=> (a.width||0)-(b.width||0));
+        let pick = files.find(f => (f.width||0) >= 720 && (f.width||0) <= 1280) || files[0];
+        if (pick && pick.link) { best = pick.link; break; }
+      }
     }
     if (!best) return null;
-    // Download to disk
     const clipPath = path.join(tempDir, 'stock' + idx + '.mp4');
     const vr = await fetch(best);
     if (!vr.ok) { console.log('Pexels download failed', vr.status); return null; }
     const buf = Buffer.from(await vr.arrayBuffer());
-    if (!buf || buf.length < 10000) return null; // too small / broken
+    if (!buf || buf.length < 10000) return null;
     fs.writeFileSync(clipPath, buf);
     return clipPath;
   } catch (e) {
@@ -66,6 +66,35 @@ async function fetchPexelsClip(query, orientation, tempDir, idx) {
     return null;
   }
 }
+
+// Return MULTIPLE candidate clips for a query (thumbnails + a downloadable file URL) for user review/replace
+async function searchPexelsCandidates(query, orientation, perPage) {
+  if (!PEXELS_KEY || !query) return [];
+  try {
+    const url = 'https://api.pexels.com/videos/search?query=' + encodeURIComponent(query)
+      + '&per_page=' + (perPage || 6) + '&orientation=' + (orientation || 'landscape');
+    const r = await fetch(url, { headers: { Authorization: PEXELS_KEY } });
+    if (!r.ok) return [];
+    const data = await r.json();
+    const videos = (data && data.videos) || [];
+    return videos.map(v => {
+      const files = (v.video_files || []).slice().sort((a,b)=> (a.width||0)-(b.width||0));
+      const pick = files.find(f => (f.width||0) >= 720 && (f.width||0) <= 1280) || files[0];
+      return {
+        id: v.id,
+        thumb: v.image,                    // preview image (jpg)
+        fileUrl: pick ? pick.link : null,  // the actual mp4 to download at render
+        duration: v.duration,
+        width: pick ? pick.width : null,
+        height: pick ? pick.height : null
+      };
+    }).filter(c => c.fileUrl && c.thumb);
+  } catch (e) {
+    console.log('Pexels candidates error for', query, ':', e.message);
+    return [];
+  }
+}
+
 
 
 // Latest video endpoint — returns most recently saved videoId (for polling after timeout)
@@ -109,7 +138,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.36.0',
+    version: '8.37.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -755,6 +784,26 @@ print(json.dumps(pal))
   }
 });
 
+// ---- Stock footage preview: returns candidate clips per scene for review/replace ----
+app.post('/api/stock/preview', async (req, res) => {
+  try {
+    if (!PEXELS_KEY) return res.json({ configured: false, scenes: [] });
+    let { queries, aspect } = req.body; // queries: array of strings (one per scene)
+    if (!Array.isArray(queries) || !queries.length) return res.status(400).json({ error: 'No queries' });
+    const orient = (aspect === 'vertical') ? 'portrait' : (aspect === 'square') ? 'square' : 'landscape';
+    const scenes = [];
+    for (let i = 0; i < queries.length; i++) {
+      const q = (queries[i] || '').toString().trim() || 'abstract background';
+      // eslint-disable-next-line no-await-in-loop
+      const candidates = await searchPexelsCandidates(q, orient, 6);
+      scenes.push({ index: i, query: q, candidates: candidates });
+    }
+    res.json({ configured: true, scenes: scenes });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---- Animated Slides renderer ----
 app.post('/api/slides/animate', async (req, res) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enerstudio-slides-'));
@@ -765,7 +814,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.36.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.37.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -828,12 +877,13 @@ app.post('/api/slides/animate', async (req, res) => {
         const secsArr = (perSlideSecs && perSlideSecs.length === nScenes)
           ? perSlideSecs.slice()
           : new Array(nScenes).fill(durationSecs / nScenes);
-        // 1) fetch clips in parallel (bounded)
+        // 1) fetch clips (use user-chosen clip URL if provided, else search by query)
         const clipPaths = [];
         for (let i = 0; i < nScenes; i++) {
+          const chosen = slides[i] && slides[i].chosenClipUrl ? slides[i].chosenClipUrl : null;
           const q = (slides[i] && (slides[i].stockQuery || (slides[i].blocks && slides[i].blocks[0] && slides[i].blocks[0].text))) || 'abstract background';
           // eslint-disable-next-line no-await-in-loop
-          const cp = await fetchPexelsClip(q, orient, tempDir, i);
+          const cp = await fetchPexelsClip(q, orient, tempDir, i, chosen);
           clipPaths.push(cp);
         }
         const gotAny = clipPaths.some(Boolean);
@@ -899,13 +949,18 @@ for idx,s in enumerate(SLIDES):
         # center the whole group vertically around 0.46 of the frame (slightly above middle)
         y=int(H*0.46)-group_h/2
         for bl in blocks:
+            tc=bl['c']
+            # brighten very dark text colors so they stay readable on darkened footage
+            if (0.2126*tc[0]+0.7152*tc[1]+0.0722*tc[2])/255.0 < 0.35:
+                tc=tuple(min(255,int(v*1.6)+60) for v in tc)
             for ln in bl['lines']:
                 fnt=bl['fnt']; fs=bl['fs']; lh=bl['lh']
                 tw=d.textlength(ln,font=fnt); x=(W-tw)/2
-                pad=fs*0.28
-                d.rectangle([x-pad,y-pad*0.4,x+tw+pad,y+lh-pad*0.2],fill=(0,0,0,140))
-                d.text((x+2,y+2),ln,font=fnt,fill=(0,0,0,210))
-                d.text((x,y),ln,font=fnt,fill=bl['c']+(255,))
+                pad=fs*0.30
+                # stronger semi-opaque panel for guaranteed contrast over any footage
+                d.rectangle([x-pad,y-pad*0.45,x+tw+pad,y+lh-pad*0.15],fill=(0,0,0,175))
+                d.text((x+2,y+2),ln,font=fnt,fill=(0,0,0,230))
+                d.text((x,y),ln,font=fnt,fill=tc+(255,))
                 y+=lh
             y+=gap
     img.save(os.path.join(OV,'ov%02d.png'%idx))
@@ -1231,7 +1286,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.36.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.37.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -1246,7 +1301,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.36.0 error:', e.message);
+    console.error('Slides v8.37.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -1313,7 +1368,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.36.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.37.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
