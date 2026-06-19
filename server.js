@@ -153,7 +153,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.49.0',
+    version: '8.50.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -953,13 +953,13 @@ app.post('/api/stock/preview', async (req, res) => {
 app.post('/api/slides/animate', async (req, res) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enerstudio-slides-'));
   try {
-    let { slides, palette, durationSecs, aspect, musicBase64, musicTrack, audioMode, voiceId, voiceSync, videoType, stockMode } = req.body;
+    let { slides, palette, durationSecs, aspect, musicBase64, musicTrack, audioMode, voiceId, voiceSync, videoType, stockMode, productImages } = req.body;
     if (!slides || !slides.length) return res.status(400).json({ error: 'No slides provided' });
     durationSecs = Math.max(4, Math.min(120, parseInt(durationSecs || '20')));
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.49.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.50.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -1008,6 +1008,167 @@ app.post('/api/slides/animate', async (req, res) => {
       } catch(e) {
         console.log('Voice generation failed, falling back to timed slides:', e.message);
         audioFile = null; perSlideSecs = null;
+      }
+    }
+
+    // ══ PRODUCT ADS BRANCH: animate uploaded product image(s) behind ad captions ══
+    if (videoType === 'productad' && Array.isArray(productImages) && productImages.length) {
+      try {
+        const nScenes = slides.length;
+        const secsArr = (perSlideSecs && perSlideSecs.length === nScenes)
+          ? perSlideSecs.slice()
+          : new Array(nScenes).fill(durationSecs / nScenes);
+
+        // 1) decode uploaded product images to disk
+        const imgPaths = [];
+        productImages.forEach((dataUrl, i) => {
+          try {
+            const b64 = String(dataUrl).split(',').pop();
+            const buf = Buffer.from(b64, 'base64');
+            if (buf && buf.length > 500) {
+              const ip = path.join(tempDir, 'prod' + i + '.png');
+              fs.writeFileSync(ip, buf);
+              imgPaths.push(ip);
+            }
+          } catch (e) { /* skip bad image */ }
+        });
+        if (!imgPaths.length) throw new Error('no valid product images — using animated fallback');
+
+        // 2) render transparent caption overlays (same engine as stock/faceless)
+        const ovDir = path.join(tempDir, 'ov');
+        fs.mkdirSync(ovDir, { recursive: true });
+        const ovPy = path.join(tempDir, 'overlays.py');
+        fs.writeFileSync(ovPy, `
+import json, glob, os
+from PIL import Image, ImageDraw, ImageFont
+W,H=${W},${H}
+PAL=json.loads(${JSON.stringify(JSON.stringify(PAL))})
+SLIDES=json.loads(${JSON.stringify(JSON.stringify(slides))})
+OV=${JSON.stringify(ovDir)}
+def ff(*names):
+    allf=glob.glob('/usr/share/fonts/**/*.ttf',recursive=True)
+    for n in names:
+        for f in allf:
+            if n.lower() in os.path.basename(f).lower(): return f
+    return allf[0] if allf else None
+FB=ff('DejaVuSans-Bold','LiberationSans-Bold','Bold')
+FR=ff('DejaVuSans','LiberationSans-Regular','Regular')
+def font(p,s):
+    try: return ImageFont.truetype(p,max(8,int(s)))
+    except: return ImageFont.load_default()
+def hx(h):
+    h=str(h).lstrip('#')
+    if len(h)!=6: h='FFFFFF'
+    return tuple(int(h[i:i+2],16) for i in (0,2,4))
+def col(spec,key,default):
+    v=spec.get(key,default); v=PAL.get(v,v)
+    return hx(v if str(v).startswith('#') else PAL.get(default,'#FFFFFF'))
+def wrap(d,text,fnt,maxw):
+    words=text.split(); lines=[]; cur=''
+    for w in words:
+        t=(cur+' '+w).strip()
+        if d.textlength(t,font=fnt)<=maxw: cur=t
+        else:
+            if cur: lines.append(cur)
+            cur=w
+    if cur: lines.append(cur)
+    return lines
+for idx,s in enumerate(SLIDES):
+    img=Image.new('RGBA',(W,H),(0,0,0,0))
+    d=ImageDraw.Draw(img)
+    # ad captions sit at the BOTTOM third so the product stays visible
+    blocks=[]
+    for b in s.get('blocks',[]):
+        txt=b.get('text','')
+        if not txt: continue
+        size=b.get('size',0.08); fs=max(20,int(size*(W if H>W else H)))
+        weight=b.get('weight','bold')
+        fnt=font(FB if weight=='bold' else FR, fs)
+        lines=wrap(d,txt,fnt,int(W*0.84))
+        lh=fs*1.25
+        c=col(b,'color','text')
+        blocks.append({'lines':lines,'fnt':fnt,'fs':fs,'lh':lh,'c':c,'h':lh*len(lines),'price':b.get('price',False)})
+    if blocks:
+        gap=int((H if H>=W else W)*0.025)
+        group_h=sum(bl['h'] for bl in blocks)+gap*(len(blocks)-1)
+        # anchor near the bottom so the product photo above stays clear
+        y=int(H*0.74)-group_h/2
+        for bl in blocks:
+            tc=bl['c']
+            if (0.2126*tc[0]+0.7152*tc[1]+0.0722*tc[2])/255.0 < 0.35:
+                tc=tuple(min(255,int(v*1.6)+60) for v in tc)
+            for ln in bl['lines']:
+                fnt=bl['fnt']; fs=bl['fs']; lh=bl['lh']
+                tw=d.textlength(ln,font=fnt); x=(W-tw)/2
+                pad=fs*0.32
+                # price/offer blocks get an accent-filled pill; others get a dark panel
+                if bl.get('price'):
+                    acc=hx(PAL.get('accent','#F4B400'))
+                    d.rectangle([x-pad,y-pad*0.45,x+tw+pad,y+lh-pad*0.15],fill=acc+(235,))
+                    d.text((x,y),ln,font=fnt,fill=(15,18,30,255))
+                else:
+                    d.rectangle([x-pad,y-pad*0.45,x+tw+pad,y+lh-pad*0.15],fill=(0,0,0,170))
+                    d.text((x+2,y+2),ln,font=fnt,fill=(0,0,0,230))
+                    d.text((x,y),ln,font=fnt,fill=tc+(255,))
+                y+=lh
+            y+=gap
+    img.save(os.path.join(OV,'ov%02d.png'%idx))
+print('overlays',len(SLIDES))
+`);
+        execSync('python3 "' + ovPy + '"', { timeout: 120000 });
+
+        // 3) per-scene: Ken Burns zoom/pan on the product image, then overlay captions
+        const sceneClips = [];
+        for (let i = 0; i < nScenes; i++) {
+          const secs = Math.max(2, secsArr[i] || 3.5);
+          const ovPng = path.join(ovDir, 'ov' + String(i).padStart(2, '0') + '.png');
+          const outClip = path.join(tempDir, 'sc' + i + '.mp4');
+          // pick an image: cycle through uploaded images per scene
+          const src = imgPaths[i % imgPaths.length];
+          const frames = Math.round(secs * 30);
+          // alternate zoom-in / zoom-out for variety
+          const zoomExpr = (i % 2 === 0) ? "min(zoom+0.0015,1.18)" : "if(lte(zoom,1.0),1.18,max(zoom-0.0015,1.0))";
+          // pad the product image onto a branded background, then ken-burns
+          const bgc = (PAL.bg_dark || '#0B1F3A').replace('#','0x');
+          const vf = "scale=" + W + ":" + H + ":force_original_aspect_ratio=decrease,"
+                   + "pad=" + W + ":" + H + ":(ow-iw)/2:(oh-ih)/2:color=" + bgc + ","
+                   + "zoompan=z='" + zoomExpr + "':d=" + frames + ":s=" + W + "x" + H + ":fps=30:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',"
+                   + "setsar=1,format=yuv420p";
+          execSync('"' + ffmpegPath + '" -y -loop 1 -t ' + secs.toFixed(2) + ' -i "' + src + '" -i "' + ovPng + '" -filter_complex "[0:v]' + vf + '[bg];[bg][1:v]overlay=0:0:format=auto,format=yuv420p[out]" -map "[out]" -t ' + secs.toFixed(2) + ' -r 30 -vsync cfr -an -c:v libx264 -preset ultrafast -threads 1 -x264-params "rc-lookahead=10:sync-lookahead=0:bframes=0:ref=1:sliced-threads=0" -crf 23 -pix_fmt yuv420p "' + outClip + '"', { timeout: 180000 });
+          sceneClips.push(outClip);
+        }
+
+        // 4) concat
+        const listF = path.join(tempDir, 'prod_concat.txt');
+        fs.writeFileSync(listF, sceneClips.map(f => "file '" + f + "'").join('\n'));
+        const stitchedV = path.join(tempDir, 'prod_stitched.mp4');
+        execSync('"' + ffmpegPath + '" -y -f concat -safe 0 -i "' + listF + '" -c:v libx264 -preset ultrafast -threads 1 -x264-params "rc-lookahead=10:sync-lookahead=0:bframes=0:ref=1:sliced-threads=0" -crf 24 -r 30 -pix_fmt yuv420p "' + stitchedV + '"', { timeout: 240000 });
+
+        // 5) audio
+        let finalV = stitchedV, muxAudioPath = null;
+        if (audioFile) { muxAudioPath = audioFile; }
+        else if (musicBase64) { muxAudioPath = path.join(tempDir, 'music_in.mp3'); fs.writeFileSync(muxAudioPath, Buffer.from(musicBase64.split(',').pop(), 'base64')); }
+        else if (musicTrack) { const cand=[path.join(__dirname, musicTrack + '.mp3'), path.join(__dirname,'music',musicTrack + '.mp3')]; muxAudioPath = cand.find(p=>{ try{return fs.existsSync(p);}catch(e){return false;} })||null; }
+        if (muxAudioPath) {
+          const withA = path.join(tempDir, 'prod_final.mp4');
+          execSync('"' + ffmpegPath + '" -y -stream_loop -1 -i "' + muxAudioPath + '" -i "' + stitchedV + '" -map 1:v -map 0:a -c:v copy -c:a aac -b:a 192k -shortest "' + withA + '" -y', { timeout: 120000 });
+          finalV = withA;
+        }
+
+        // 6) store + return
+        const vid = 'vid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+        const finalPath = path.join(os.tmpdir(), vid + '.mp4');
+        fs.copyFileSync(finalV, finalPath);
+        const sz = fs.statSync(finalPath).size;
+        outputStore[vid] = { path: finalPath, size: sz, created: Date.now() };
+        let videoData = null;
+        if (sz < 20 * 1024 * 1024) videoData = 'data:video/mp4;base64,' + fs.readFileSync(finalPath).toString('base64');
+        try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(e) {}
+        console.log('Product Ad video ready', vid, Math.round(sz/1024) + 'KB', imgPaths.length + ' images');
+        return res.json({ videoId: vid, size: sz, videoData: videoData, productad: true });
+      } catch (prodErr) {
+        console.log('Product-ad path failed, falling back to animated:', prodErr.message);
+        // fall through to normal renderer
       }
     }
 
@@ -1431,7 +1592,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.49.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.50.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -1446,7 +1607,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.49.0 error:', e.message);
+    console.error('Slides v8.50.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -1513,7 +1674,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.49.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.50.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
