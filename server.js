@@ -40,17 +40,26 @@ async function fetchPexelsClip(query, orientation, tempDir, idx, directUrl) {
     let best = directUrl || null;
     if (!best) {
       if (!query) return null;
-      const url = 'https://api.pexels.com/videos/search?query=' + encodeURIComponent(query)
-        + '&per_page=5&orientation=' + (orientation || 'landscape');
-      const r = await fetch(url, { headers: { Authorization: PEXELS_KEY } });
-      if (!r.ok) { console.log('Pexels search failed', r.status, 'for', query); return null; }
-      const data = await r.json();
-      const videos = (data && data.videos) || [];
-      if (!videos.length) { console.log('Pexels no results for', query); return null; }
-      for (const v of videos) {
-        const files = (v.video_files || []).slice().sort((a,b)=> (a.width||0)-(b.width||0));
-        let pick = files.find(f => (f.width||0) >= 720 && (f.width||0) <= 1280) || files[0];
-        if (pick && pick.link) { best = pick.link; break; }
+      async function searchFirst(q) {
+        const url = 'https://api.pexels.com/videos/search?query=' + encodeURIComponent(q)
+          + '&per_page=5&orientation=' + (orientation || 'landscape');
+        const rr = await fetch(url, { headers: { Authorization: PEXELS_KEY } });
+        if (!rr.ok) return null;
+        const dd = await rr.json();
+        const vids = (dd && dd.videos) || [];
+        for (const v of vids) {
+          const files = (v.video_files || []).slice().sort((a,b)=> (a.width||0)-(b.width||0));
+          let pick = files.find(f => (f.width||0) >= 720 && (f.width||0) <= 1280) || files[0];
+          if (pick && pick.link) return pick.link;
+        }
+        return null;
+      }
+      best = await searchFirst(query);
+      if (!best) {
+        const words = query.trim().split(/\s+/);
+        const broad = words.slice(-2).join(' ');
+        if (broad && broad !== query) best = await searchFirst(broad);
+        if (!best) best = await searchFirst('business professional');
       }
     }
     if (!best) return null;
@@ -70,8 +79,8 @@ async function fetchPexelsClip(query, orientation, tempDir, idx, directUrl) {
 // Return MULTIPLE candidate clips for a query (thumbnails + a downloadable file URL) for user review/replace
 async function searchPexelsCandidates(query, orientation, perPage) {
   if (!PEXELS_KEY || !query) return [];
-  try {
-    const url = 'https://api.pexels.com/videos/search?query=' + encodeURIComponent(query)
+  async function doSearch(q) {
+    const url = 'https://api.pexels.com/videos/search?query=' + encodeURIComponent(q)
       + '&per_page=' + (perPage || 6) + '&orientation=' + (orientation || 'landscape');
     const r = await fetch(url, { headers: { Authorization: PEXELS_KEY } });
     if (!r.ok) return [];
@@ -80,15 +89,20 @@ async function searchPexelsCandidates(query, orientation, perPage) {
     return videos.map(v => {
       const files = (v.video_files || []).slice().sort((a,b)=> (a.width||0)-(b.width||0));
       const pick = files.find(f => (f.width||0) >= 720 && (f.width||0) <= 1280) || files[0];
-      return {
-        id: v.id,
-        thumb: v.image,                    // preview image (jpg)
-        fileUrl: pick ? pick.link : null,  // the actual mp4 to download at render
-        duration: v.duration,
-        width: pick ? pick.width : null,
-        height: pick ? pick.height : null
-      };
+      return { id: v.id, thumb: v.image, fileUrl: pick ? pick.link : null, duration: v.duration,
+               width: pick ? pick.width : null, height: pick ? pick.height : null };
     }).filter(c => c.fileUrl && c.thumb);
+  }
+  try {
+    let out = await doSearch(query);
+    if (!out.length) {
+      // broaden: try the last two words, then a generic business fallback
+      const words = query.trim().split(/\s+/);
+      const broad = words.slice(-2).join(' ');
+      if (broad && broad !== query) out = await doSearch(broad);
+      if (!out.length) out = await doSearch('business professional');
+    }
+    return out;
   } catch (e) {
     console.log('Pexels candidates error for', query, ':', e.message);
     return [];
@@ -138,7 +152,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.37.0',
+    version: '8.38.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -814,7 +828,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.37.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.38.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -1286,7 +1300,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.37.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.38.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -1301,7 +1315,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.37.0 error:', e.message);
+    console.error('Slides v8.38.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -1368,7 +1382,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.37.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.38.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
