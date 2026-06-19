@@ -109,7 +109,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.35.0',
+    version: '8.36.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -765,7 +765,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.35.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.36.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -921,13 +921,13 @@ print('overlays',len(SLIDES))
           const outClip = path.join(tempDir, 'sc' + i + '.mp4');
           const src = clipPaths[i];
           if (src) {
-            // scale to cover WxH, crop center, darken 30%, loop if short, overlay caption
-            const vf = "scale=" + W + ":" + H + ":force_original_aspect_ratio=increase,crop=" + W + ":" + H + ",eq=brightness=-0.10:saturation=1.05";
-            execSync('"' + ffmpegPath + '" -y -stream_loop -1 -t ' + secs.toFixed(2) + ' -i "' + src + '" -i "' + ovPng + '" -filter_complex "[0:v]' + vf + '[bg];[bg][1:v]overlay=0:0:format=auto" -t ' + secs.toFixed(2) + ' -r 30 -an -c:v libx264 -preset ultrafast -threads 1 -x264-params "rc-lookahead=10:sync-lookahead=0:bframes=0:ref=1:sliced-threads=0" -crf 23 -pix_fmt yuv420p "' + outClip + '"', { timeout: 180000 });
+            // scale to cover WxH, crop center, darken, force uniform fps+sar+format so concat is seamless
+            const vf = "scale=" + W + ":" + H + ":force_original_aspect_ratio=increase,crop=" + W + ":" + H + ",eq=brightness=-0.10:saturation=1.05,fps=30,setsar=1";
+            execSync('"' + ffmpegPath + '" -y -stream_loop -1 -t ' + secs.toFixed(2) + ' -i "' + src + '" -i "' + ovPng + '" -filter_complex "[0:v]' + vf + '[bg];[bg][1:v]overlay=0:0:format=auto,format=yuv420p[out]" -map "[out]" -t ' + secs.toFixed(2) + ' -r 30 -vsync cfr -an -c:v libx264 -preset ultrafast -threads 1 -x264-params "rc-lookahead=10:sync-lookahead=0:bframes=0:ref=1:sliced-threads=0" -crf 23 -pix_fmt yuv420p "' + outClip + '"', { timeout: 180000 });
           } else {
             // no clip for this scene: solid brand-color bg + caption (graceful)
             const bgc = (PAL.bg_dark || '#0B1F3A').replace('#','0x');
-            execSync('"' + ffmpegPath + '" -y -f lavfi -t ' + secs.toFixed(2) + ' -i "color=c=' + bgc + ':s=' + W + 'x' + H + ':r=30" -i "' + ovPng + '" -filter_complex "[0:v][1:v]overlay=0:0:format=auto" -t ' + secs.toFixed(2) + ' -an -c:v libx264 -preset ultrafast -threads 1 -crf 23 -pix_fmt yuv420p "' + outClip + '"', { timeout: 120000 });
+            execSync('"' + ffmpegPath + '" -y -f lavfi -t ' + secs.toFixed(2) + ' -i "color=c=' + bgc + ':s=' + W + 'x' + H + ':r=30" -i "' + ovPng + '" -filter_complex "[0:v][1:v]overlay=0:0:format=auto,format=yuv420p,setsar=1[out]" -map "[out]" -t ' + secs.toFixed(2) + ' -r 30 -vsync cfr -an -c:v libx264 -preset ultrafast -threads 1 -crf 23 -pix_fmt yuv420p "' + outClip + '"', { timeout: 120000 });
           }
           sceneClips.push(outClip);
         }
@@ -936,7 +936,7 @@ print('overlays',len(SLIDES))
         const listF = path.join(tempDir, 'stock_concat.txt');
         fs.writeFileSync(listF, sceneClips.map(f => "file '" + f + "'").join('\n'));
         const stitchedV = path.join(tempDir, 'stock_stitched.mp4');
-        execSync('"' + ffmpegPath + '" -y -f concat -safe 0 -i "' + listF + '" -c copy "' + stitchedV + '"', { timeout: 180000 });
+        execSync('"' + ffmpegPath + '" -y -f concat -safe 0 -i "' + listF + '" -c:v libx264 -preset ultrafast -threads 1 -x264-params "rc-lookahead=10:sync-lookahead=0:bframes=0:ref=1:sliced-threads=0" -crf 24 -r 30 -pix_fmt yuv420p "' + stitchedV + '"', { timeout: 240000 });
 
         // 5) audio: voice (already built) or music track/upload
         let finalV = stitchedV;
@@ -1231,7 +1231,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.35.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.36.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -1246,7 +1246,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.35.0 error:', e.message);
+    console.error('Slides v8.36.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -1313,7 +1313,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.35.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.36.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
