@@ -153,7 +153,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.45.0',
+    version: '8.46.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -896,10 +896,19 @@ app.get('/api/heygen/status/:id', async (req, res) => {
     const data = await r.json();
     const d = (data && data.data) || {};
     const status = d.status || 'unknown';
-    if (status === 'completed' && d.video_url) {
-      // download and store so the client gets a stable URL + optional inline
+    // HeyGen may put the URL in different fields depending on API version
+    const videoUrl = d.video_url || d.video_url_caption || (d.video && d.video.url) || null;
+    if (status === 'completed') {
+      if (!videoUrl) {
+        // completed but no URL yet — tell client to keep polling briefly
+        return res.json({ status: 'processing', note: 'finalizing' });
+      }
+      // Try to download for a stable local copy, but DON'T let a slow download hang forever.
       try {
-        const vr = await fetch(d.video_url);
+        const ctrl = new AbortController();
+        const to = setTimeout(() => ctrl.abort(), 25000);
+        const vr = await fetch(videoUrl, { signal: ctrl.signal });
+        clearTimeout(to);
         const buf = Buffer.from(await vr.arrayBuffer());
         const vid = 'vid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
         const fp = path.join(os.tmpdir(), vid + '.mp4');
@@ -907,9 +916,10 @@ app.get('/api/heygen/status/:id', async (req, res) => {
         outputStore[vid] = { path: fp, size: buf.length, created: Date.now() };
         let videoData = null;
         if (buf.length < 20 * 1024 * 1024) videoData = 'data:video/mp4;base64,' + buf.toString('base64');
-        return res.json({ status: 'completed', videoId: vid, size: buf.length, videoData, heygenUrl: d.video_url });
+        return res.json({ status: 'completed', videoId: vid, size: buf.length, videoData, heygenUrl: videoUrl });
       } catch (dlErr) {
-        return res.json({ status: 'completed', heygenUrl: d.video_url, error: 'local store failed' });
+        // download slow/failed — still give the client the playable HeyGen URL so it's never stuck
+        return res.json({ status: 'completed', heygenUrl: videoUrl });
       }
     }
     if (status === 'failed') return res.json({ status: 'failed', error: (d.error && d.error.message) || 'generation failed' });
@@ -949,7 +959,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.45.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.46.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -1421,7 +1431,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.45.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.46.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -1436,7 +1446,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.45.0 error:', e.message);
+    console.error('Slides v8.46.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -1503,7 +1513,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.45.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.46.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
