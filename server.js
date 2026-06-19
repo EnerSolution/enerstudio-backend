@@ -72,7 +72,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.25.0',
+    version: '8.26.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -426,7 +426,7 @@ app.post('/api/whiteboard/animate', async (req, res) => {
       return res.status(400).json({ error: 'No image URLs provided' });
     }
     const numScenes = imageUrls.length;
-    console.log('Whiteboard v8.25.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
+    console.log('Whiteboard v8.26.0:', numScenes, 'scenes, pythonReady=' + pythonReady);
 
     const handPath = path.join(tempDir, 'hand.png');
     fs.writeFileSync(handPath, Buffer.from(HAND_B64_WB, 'base64'));
@@ -641,11 +641,11 @@ print(f'done:{total_frames}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Whiteboard v8.25.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Whiteboard v8.26.0 ready:', fileSize, 'bytes, id:', videoId);
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, scenes:imageUrls.length });
 
   } catch(e) {
-    console.error('Whiteboard v8.25.0 error:', e.message);
+    console.error('Whiteboard v8.26.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -727,7 +727,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.25.0:', slides.length, 'slides,', W+'x'+H, audioMode||'music', 'pythonReady='+pythonReady);
+    console.log('Slides v8.26.0:', slides.length, 'slides,', W+'x'+H, audioMode||'music', 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -864,15 +864,20 @@ def paint_bg(img,spec,t):
         x += 0.012*math.sin(2*math.pi*(t*0.6)+ph)
         y += 0.018*math.cos(2*math.pi*(t*0.5)+ph)
         op=int(210*min(1.0,e+0.1))
-        layer=Image.new('RGBA',(W,H),(0,0,0,0)); ld=ImageDraw.Draw(layer)
         if sh.get('kind')=='circle':
-            r=int(sh.get('r',0.1)*W*scale); cx,cy=int(x*W),int(y*H); ld.ellipse([cx-r,cy-r,cx+r,cy+r],fill=c+(op,))
+            r=int(sh.get('r',0.1)*W*scale); cx,cy=int(x*W),int(y*H)
+            d=r*2+4; tile=Image.new('RGBA',(d,d),(0,0,0,0)); td=ImageDraw.Draw(tile)
+            td.ellipse([2,2,2+r*2,2+r*2],fill=c+(op,))
+            img.alpha_composite(tile,(cx-r-2,cy-r-2))
         elif sh.get('kind')=='ring':
             r=int(sh.get('r',0.1)*W*scale); cx,cy=int(x*W),int(y*H); wd=max(4,int(r*0.16))
-            ld.ellipse([cx-r,cy-r,cx+r,cy+r],outline=c+(op,),width=wd)
+            d=r*2+4; tile=Image.new('RGBA',(d,d),(0,0,0,0)); td=ImageDraw.Draw(tile)
+            td.ellipse([2,2,2+r*2,2+r*2],outline=c+(op,),width=wd)
+            img.alpha_composite(tile,(cx-r-2,cy-r-2))
         elif sh.get('kind')=='bar':
-            bxp,byp=int(x*W),int(y*H); ld.rectangle([bxp,byp,bxp+int(sh.get('w',0.2)*W*scale),byp+int(sh.get('h',0.02)*H)],fill=c+(op,))
-        img.alpha_composite(layer)
+            bw=int(sh.get('w',0.2)*W*scale); bh=max(1,int(sh.get('h',0.02)*H)); bxp,byp=int(x*W),int(y*H)
+            tile=Image.new('RGBA',(max(1,bw),max(1,bh)),c+(op,))
+            img.alpha_composite(tile,(bxp,byp))
 def bg_lum_at(spec, fx, fy):
     # Estimate background brightness at a point WITHOUT reading pixels (fast).
     kind=spec.get('type','solid')
@@ -905,7 +910,7 @@ def draw_block(base,blk,prog):
     anim=blk.get('anim','fade'); shown=txt
     if anim=='type': shown=txt[:max(0,int(len(txt)*prog))]
     f=font(fp,size)
-    layer=Image.new('RGBA',(W,H),(0,0,0,0)); ld=ImageDraw.Draw(layer)
+    _m=Image.new('RGBA',(1,1)); ld=ImageDraw.Draw(_m)
     maxw=int(W*0.86); bb=ld.textbbox((0,0),txt or ' ',font=f)
     while (bb[2]-bb[0])>maxw and size>10:
         size=int(size*0.92); f=font(fp,size); bb=ld.textbbox((0,0),txt or ' ',font=f)
@@ -923,23 +928,25 @@ def draw_block(base,blk,prog):
     elif anim=='pop':
         f=font(fp,max(8,int(size*lerp(0.6,1,e)))); a=e
         bb=ld.textbbox((0,0),shown or ' ',font=f); tw,th=bb[2]-bb[0],bb[3]-bb[1]; x=cx-tw//2 if align=='center' else (cx if align=='left' else cx-tw); y=cy-th//2
-    # drop shadow for depth (offset dark copy behind the text)
+    # ── Draw everything onto a SMALL tile sized to the text (memory-light for vertical) ──
     sh_off=max(2,int(REF*0.006))
-    ld.text((x+dx-bb[0]+sh_off, y+dy-bb[1]+sh_off), shown, font=f, fill=(0,0,0,int(150*a)))
-    ld.text((x+dx-bb[0],y+dy-bb[1]),shown,font=f,fill=c+(int(255*a),))
-    # ── subtle dark backing panel behind text for guaranteed readability over shapes ──
-    if a>0.05 and (bb[2]-bb[0])>0:
-        fbb=ld.textbbox((0,0),txt or ' ',font=f); fw,fh=fbb[2]-fbb[0],fbb[3]-fbb[1]
-        fx=cx-fw//2 if align=='center' else (cx if align=='left' else cx-fw)
-        padx,pady=int(REF*0.035),int(REF*0.03)
-        panel=Image.new('RGBA',(W,H),(0,0,0,0)); pdr=ImageDraw.Draw(panel)
-        # soft shadow under the panel, then the panel itself (gives a floating 3D card look)
-        pdr.rounded_rectangle([fx+dx-padx+sh_off*2, (cy-fh//2)+dy-pady+sh_off*2, fx+dx+fw+padx+sh_off*2, (cy-fh//2)+dy+fh+pady+sh_off*2],
+    padx,pady=int(REF*0.035),int(REF*0.03)
+    margin=padx+sh_off*3
+    tw2=max(1,tw+margin*2); th2=max(1,th+margin*2)
+    tile=Image.new('RGBA',(tw2,th2),(0,0,0,0)); tl=ImageDraw.Draw(tile)
+    # local coords: text origin inside tile
+    lx=margin-bb[0]; ly=margin-bb[1]
+    # panel behind text (shadow + card)
+    if a>0.05:
+        tl.rounded_rectangle([margin-padx+sh_off*2, margin-pady+sh_off*2, margin+tw+padx+sh_off*2, margin+th+pady+sh_off*2],
                              radius=int(REF*0.025), fill=(0,0,0,int(45*a)))
-        pdr.rounded_rectangle([fx+dx-padx, (cy-fh//2)+dy-pady, fx+dx+fw+padx, (cy-fh//2)+dy+fh+pady],
+        tl.rounded_rectangle([margin-padx, margin-pady, margin+tw+padx, margin+th+pady],
                              radius=int(REF*0.025), fill=(0,0,0,int(85*a)))
-        base.alpha_composite(panel)   # panel first (behind)
-    base.alpha_composite(layer)        # text on top
+    # drop shadow + text
+    tl.text((lx+sh_off, ly+sh_off), shown, font=f, fill=(0,0,0,int(150*a)))
+    tl.text((lx, ly), shown, font=f, fill=c+(int(255*a),))
+    # composite tile at the block position
+    base.alpha_composite(tile, (x+dx-margin, y+dy-margin))
 os.makedirs(FRAME_DIR,exist_ok=True)
 # Per-slide frame counts: use voice durations if present, else equal split
 if PER_SLIDE:
@@ -1028,7 +1035,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.25.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.26.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -1043,7 +1050,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.25.0 error:', e.message);
+    console.error('Slides v8.26.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -1110,7 +1117,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.25.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.26.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
