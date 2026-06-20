@@ -153,7 +153,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.59.0',
+    version: '8.60.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -891,22 +891,118 @@ app.post('/api/heygen/generate', async (req, res) => {
   }
 });
 
+// ── GUARDRAIL: block real/identifiable people (esp. public figures) ──
+// Uses Claude to classify a character description. Returns {allowed, reason}.
+async function checkCharacterAllowed(description) {
+  try {
+    if (!ANTHROPIC_KEY) return { allowed: true }; // fail-open only if no classifier available
+    const sys = 'You are a content-safety classifier for an AI video tool that animates a generated character to speak. '
+      + 'Your job: decide if a character description attempts to depict a REAL, IDENTIFIABLE person — including celebrities, politicians, public figures, executives, influencers, or a specific named private individual. '
+      + 'Fictional/generic/original characters (e.g. "a friendly female solar advisor", "a cartoon dog in a suit", "an elderly male professor") are ALLOWED. '
+      + 'Respond ONLY with strict JSON: {"real_person": true/false, "who": "name or empty"}. No other text.';
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 100, system: sys, messages: [{ role: 'user', content: 'Character description: ' + description }] })
+    });
+    const d = await r.json();
+    let txt = (d && d.content && d.content[0] && d.content[0].text) ? d.content[0].text : '';
+    txt = txt.replace(/```json|```/g, '').trim();
+    let parsed = null; try { parsed = JSON.parse(txt); } catch(e){ const m = txt.match(/\{[\s\S]*\}/); if(m) parsed = JSON.parse(m[0]); }
+    if (parsed && parsed.real_person === true) {
+      return { allowed: false, who: parsed.who || 'a real person' };
+    }
+    return { allowed: true };
+  } catch (e) {
+    // On classifier error, be cautious: block, since this protects the platform
+    return { allowed: false, who: 'unverified (safety check unavailable)' };
+  }
+}
+
+// ── AI CHARACTER PHOTO: generate a brand-safe character photo from a description ──
+app.post('/api/heygen/character', async (req, res) => {
+  if (!HEYGEN_KEY) return res.status(400).json({ error: 'HeyGen not configured' });
+  try {
+    const { description, gender } = req.body;
+    if (!description) return res.status(400).json({ error: 'description required' });
+
+    // GUARDRAIL — refuse real/identifiable people
+    const check = await checkCharacterAllowed(description);
+    if (!check.allowed) {
+      return res.status(400).json({ blocked: true, error: 'For legal and safety reasons, we can\u2019t create videos depicting real or identifiable people' + (check.who && check.who !== 'a real person' ? ' (detected: ' + check.who + ')' : '') + '. Please describe an original or fictional character instead — e.g. "a friendly female solar advisor in her 30s" or "a cartoon dog in a business suit".' });
+    }
+
+    // generate a photo avatar from the description
+    const g = (gender || '').toLowerCase();
+    const genderWord = g === 'male' ? 'Man' : (g === 'female' ? 'Woman' : 'Person');
+    const genRes = await fetch('https://api.heygen.com/v2/photo_avatar/photo/generate', {
+      method: 'POST',
+      headers: { 'X-Api-Key': HEYGEN_KEY, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({
+        name: 'EnerChar_' + Date.now(),
+        age: 'Young Adult',
+        gender: genderWord,
+        ethnicity: 'Unspecified',
+        orientation: 'horizontal',
+        pose: 'half_body',
+        style: 'Realistic',
+        appearance: description
+      })
+    });
+    const genData = await genRes.json();
+    const genId = genData && genData.data && genData.data.generation_id;
+    if (!genRes.ok || !genId) {
+      return res.status(502).json({ error: 'Character generation failed: ' + JSON.stringify(genData).slice(0, 200) });
+    }
+    res.json({ generationId: genId });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Poll a character-photo generation; returns image_url(s) when ready
+app.get('/api/heygen/character/:genId', async (req, res) => {
+  if (!HEYGEN_KEY) return res.status(400).json({ error: 'HeyGen not configured' });
+  try {
+    const r = await fetch('https://api.heygen.com/v2/photo_avatar/generation/' + encodeURIComponent(req.params.genId), {
+      headers: { 'X-Api-Key': HEYGEN_KEY }
+    });
+    const d = await r.json();
+    const data = d && d.data;
+    const status = data && (data.status || '');
+    if (status === 'success' || (data && data.image_url_list && data.image_url_list.length)) {
+      const imgs = (data && (data.image_url_list || (data.image_url ? [data.image_url] : []))) || [];
+      return res.json({ status: 'completed', images: imgs });
+    }
+    if (status === 'failed') return res.json({ status: 'failed', error: 'character generation failed' });
+    res.json({ status: 'processing' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── TALKING PHOTO (Avatar IV — HeyGen's most advanced image-to-video) ──
 // Accepts a base64 photo, uploads it to get a talking_photo_id, then generates a
 // lifelike talking video with Avatar IV (expressive motion, natural gestures, 1080p).
 app.post('/api/heygen/talkingphoto', async (req, res) => {
   if (!HEYGEN_KEY) return res.status(400).json({ error: 'HeyGen not configured' });
   try {
-    let { photo, script, gender, aspect } = req.body;
-    if (!photo || !script) return res.status(400).json({ error: 'photo and script are required' });
+    let { photo, photoUrl, script, gender, aspect } = req.body;
+    if ((!photo && !photoUrl) || !script) return res.status(400).json({ error: 'a photo (or photoUrl) and script are required' });
 
-    // 1) upload the image asset to HeyGen → talking_photo_id
-    const b64 = String(photo).split(',').pop();
-    const buf = Buffer.from(b64, 'base64');
-    // detect content type from the data URI prefix
-    let ctype = 'image/jpeg';
-    const m = String(photo).match(/^data:(image\/[a-zA-Z+]+);base64/);
-    if (m) ctype = m[1];
+    // 1) get image bytes — from uploaded base64, or by fetching the AI-generated character URL
+    let buf, ctype = 'image/jpeg';
+    if (photoUrl && !photo) {
+      const ir = await fetch(photoUrl);
+      if (!ir.ok) return res.status(502).json({ error: 'Could not fetch generated character image' });
+      buf = Buffer.from(await ir.arrayBuffer());
+      ctype = ir.headers.get('content-type') || 'image/jpeg';
+    } else {
+      const b64 = String(photo).split(',').pop();
+      buf = Buffer.from(b64, 'base64');
+      const m = String(photo).match(/^data:(image\/[a-zA-Z+]+);base64/);
+      if (m) ctype = m[1];
+    }
     const upRes = await fetch('https://upload.heygen.com/v1/talking_photo', {
       method: 'POST',
       headers: { 'X-Api-Key': HEYGEN_KEY, 'Content-Type': ctype },
@@ -1150,7 +1246,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.59.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.60.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -1783,7 +1879,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.59.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.60.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -1798,7 +1894,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.59.0 error:', e.message);
+    console.error('Slides v8.60.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -1865,7 +1961,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.59.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.60.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
