@@ -153,7 +153,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.58.0',
+    version: '8.59.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -891,6 +891,76 @@ app.post('/api/heygen/generate', async (req, res) => {
   }
 });
 
+// ── TALKING PHOTO (Avatar IV — HeyGen's most advanced image-to-video) ──
+// Accepts a base64 photo, uploads it to get a talking_photo_id, then generates a
+// lifelike talking video with Avatar IV (expressive motion, natural gestures, 1080p).
+app.post('/api/heygen/talkingphoto', async (req, res) => {
+  if (!HEYGEN_KEY) return res.status(400).json({ error: 'HeyGen not configured' });
+  try {
+    let { photo, script, gender, aspect } = req.body;
+    if (!photo || !script) return res.status(400).json({ error: 'photo and script are required' });
+
+    // 1) upload the image asset to HeyGen → talking_photo_id
+    const b64 = String(photo).split(',').pop();
+    const buf = Buffer.from(b64, 'base64');
+    // detect content type from the data URI prefix
+    let ctype = 'image/jpeg';
+    const m = String(photo).match(/^data:(image\/[a-zA-Z+]+);base64/);
+    if (m) ctype = m[1];
+    const upRes = await fetch('https://upload.heygen.com/v1/talking_photo', {
+      method: 'POST',
+      headers: { 'X-Api-Key': HEYGEN_KEY, 'Content-Type': ctype },
+      body: buf
+    });
+    const upData = await upRes.json();
+    const tpId = upData && upData.data && (upData.data.talking_photo_id || upData.data.id);
+    if (!upRes.ok || !tpId) {
+      return res.status(502).json({ error: 'Photo upload failed: ' + JSON.stringify(upData).slice(0, 250) });
+    }
+
+    // 2) pick a valid HeyGen voice
+    const hgVoice = await getHeyGenVoiceId((gender || '').toLowerCase());
+    if (!hgVoice) return res.status(502).json({ error: 'No HeyGen voice available on this account' });
+
+    const dim = (aspect === 'vertical') ? { width: 720, height: 1280 }
+              : (aspect === 'square') ? { width: 1080, height: 1080 }
+              : { width: 1920, height: 1080 };
+
+    // 3) generate with Avatar IV motion engine (the quality differentiator)
+    const body = {
+      video_inputs: [{
+        character: { type: 'talking_photo', talking_photo_id: tpId },
+        voice: { type: 'text', input_text: script, voice_id: hgVoice }
+      }],
+      use_avatar_iv_model: true,
+      dimension: dim
+    };
+    const gen = await fetch('https://api.heygen.com/v2/video/generate', {
+      method: 'POST',
+      headers: { 'X-Api-Key': HEYGEN_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const genData = await gen.json();
+    const vidId = genData && genData.data && genData.data.video_id;
+    if (!gen.ok || !vidId) {
+      // fallback: retry without Avatar IV flag in case the account lacks access
+      const body2 = JSON.parse(JSON.stringify(body)); delete body2.use_avatar_iv_model;
+      const gen2 = await fetch('https://api.heygen.com/v2/video/generate', {
+        method: 'POST', headers: { 'X-Api-Key': HEYGEN_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify(body2)
+      });
+      const genData2 = await gen2.json();
+      const vidId2 = genData2 && genData2.data && genData2.data.video_id;
+      if (!gen2.ok || !vidId2) {
+        return res.status(502).json({ error: 'Talking Photo generation failed: ' + JSON.stringify(genData).slice(0, 250) });
+      }
+      return res.json({ videoId: vidId2, engine: 'standard' });
+    }
+    res.json({ videoId: vidId, engine: 'avatar_iv' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Poll generation status; when done, download the MP4 and return inline (if small) + a local id
 app.get('/api/heygen/status/:id', async (req, res) => {
   if (!HEYGEN_KEY) return res.status(400).json({ error: 'HeyGen not configured' });
@@ -1080,7 +1150,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.58.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.59.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -1713,7 +1783,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.58.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.59.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -1728,7 +1798,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.58.0 error:', e.message);
+    console.error('Slides v8.59.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -1795,7 +1865,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.58.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.59.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
