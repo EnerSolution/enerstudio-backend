@@ -153,7 +153,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.65.0',
+    version: '8.66.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -219,6 +219,63 @@ app.get('/api/runway/balance', async (req, res) => {
     res.json(await response.json());
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ── BRAND PROFILE: read the brand's website (best-effort) + description, distill a brand brief ──
+// The brief is saved once with the brand and injected into every future script/ad for richer, on-brand output.
+app.post('/api/brand/profile', async (req, res) => {
+  try {
+    let { name, website, description } = req.body || {};
+    name = (name || '').trim();
+    website = (website || '').trim();
+    description = (description || '').trim();
+    if (!name) return res.status(400).json({ error: 'brand name required' });
+
+    // 1) best-effort: fetch website text (graceful — never blocks)
+    let siteText = '';
+    let siteRead = false;
+    if (website) {
+      let url = website;
+      if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+      try {
+        const ctrl = new AbortController();
+        const to = setTimeout(() => ctrl.abort(), 12000);
+        const r = await fetch(url, { signal: ctrl.signal, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; EnerStudioBot/1.0)' } });
+        clearTimeout(to);
+        if (r.ok) {
+          let html = await r.text();
+          // strip scripts/styles/tags → plain text, cap length
+          html = html.replace(/<script[\s\S]*?<\/script>/gi, ' ').replace(/<style[\s\S]*?<\/style>/gi, ' ');
+          const text = html.replace(/<[^>]+>/g, ' ').replace(/&[a-z]+;/gi, ' ').replace(/\s+/g, ' ').trim();
+          if (text && text.length > 80) { siteText = text.slice(0, 6000); siteRead = true; }
+        }
+      } catch (e) { /* site unreadable — fall back to description */ }
+    }
+
+    // 2) distill a compact brand brief with the AI
+    if (!ANTHROPIC_KEY) return res.json({ brief: description || ('Brand: ' + name), siteRead: false });
+    const sys = 'You build concise brand briefs that help an AI write on-brand marketing video scripts. '
+      + 'Output ONLY the brief as plain text (no preamble, no markdown headers). Keep it under 180 words. '
+      + 'Cover: what the business does, who its customers are, its tone/voice, key products or services, and a likely call-to-action. '
+      + 'If information is thin, infer sensibly from what is given but do not invent specific facts (prices, claims, awards).';
+    let userMsg = 'Brand name: ' + name + '\n';
+    if (website) userMsg += 'Website: ' + website + '\n';
+    if (description) userMsg += 'Owner description: ' + description + '\n';
+    if (siteText) userMsg += '\nWebsite content (extracted):\n' + siteText;
+    if (!description && !siteText) userMsg += '\n(Only the name is available — write a minimal, generic brief.)';
+
+    const ai = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': ANTHROPIC_KEY, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-5', max_tokens: 500, system: sys, messages: [{ role: 'user', content: userMsg }] })
+    });
+    const aiData = await ai.json();
+    const brief = (aiData && aiData.content && aiData.content[0] && aiData.content[0].text ? aiData.content[0].text : (description || ('Brand: ' + name))).trim();
+    res.json({ brief: brief, siteRead: siteRead });
+  } catch (e) {
+    // never hard-fail brand creation — return a safe fallback brief
+    res.json({ brief: (req.body && req.body.description) || ('Brand: ' + ((req.body && req.body.name) || '')), siteRead: false, note: e.message });
   }
 });
 
@@ -1269,7 +1326,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.65.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.66.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -1902,7 +1959,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.65.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.66.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -1917,7 +1974,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.65.0 error:', e.message);
+    console.error('Slides v8.66.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -1984,7 +2041,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.65.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.66.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
