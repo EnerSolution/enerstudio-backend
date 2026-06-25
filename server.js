@@ -153,7 +153,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.67.0',
+    version: '8.68.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -1330,6 +1330,81 @@ print('ov ok')
   }
 });
 
+// ---- Spokesperson finalize: animate any image (Runway video) + spoken voiceover (ElevenLabs) ----
+// Used for Enzo and any mascot/character that can't use HeyGen lip-sync. Motion + VO, no captions.
+app.post('/api/spokesperson/finalize', async (req, res) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'enerstudio-spokes-'));
+  try {
+    let { videoUrl, script, voiceId, aspect, musicTrack } = req.body;
+    if (!videoUrl || !script) return res.status(400).json({ error: 'videoUrl and script required' });
+    const dim = (aspect === 'vertical') ? { W:1080, H:1920 } : (aspect === 'square') ? { W:1080, H:1080 } : { W:1280, H:720 };
+    const W = dim.W, H = dim.H;
+
+    // 1) download Runway clip
+    const srcPath = path.join(tempDir, 'src.mp4');
+    const vr = await fetch(videoUrl);
+    if (!vr.ok) throw new Error('Could not download animation');
+    fs.writeFileSync(srcPath, Buffer.from(await vr.arrayBuffer()));
+
+    // 2) generate voiceover (ElevenLabs)
+    if (!ELEVENLABS_KEY) throw new Error('Voice service not configured');
+    let vid = voiceId || await getFirstVoice();
+    if (!vid) vid = 'EXAVITQu4vr4xnSDxMaL';
+    const ttsRes = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + vid, {
+      method: 'POST',
+      headers: { 'xi-api-key': ELEVENLABS_KEY, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
+      body: JSON.stringify({ text: script, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.5, similarity_boost: 0.75 } })
+    });
+    if (!ttsRes.ok) throw new Error('Voiceover failed: ' + ttsRes.status);
+    const voPath = path.join(tempDir, 'vo.mp3');
+    fs.writeFileSync(voPath, Buffer.from(await ttsRes.arrayBuffer()));
+
+    // 3) measure VO duration so the video covers the whole script
+    let voDur = 8;
+    try {
+      const probe = execSync('"' + ffmpegPath + '" -i "' + voPath + '" 2>&1 | grep Duration', { encoding: 'utf8' });
+      const m = probe.match(/Duration:\s*(\d+):(\d+):(\d+\.?\d*)/);
+      if (m) voDur = (+m[1])*3600 + (+m[2])*60 + parseFloat(m[3]);
+    } catch(e) {}
+    voDur = Math.max(2, voDur + 0.4);
+
+    // 4) normalize the Runway clip to target size, then loop it to cover the VO length
+    const norm = path.join(tempDir, 'norm.mp4');
+    const vf = "scale=" + W + ":" + H + ":force_original_aspect_ratio=increase,crop=" + W + ":" + H + ",setsar=1,fps=30,format=yuv420p";
+    execSync('"' + ffmpegPath + '" -y -i "' + srcPath + '" -an -vf "' + vf + '" -c:v libx264 -preset ultrafast -threads 1 -x264-params "rc-lookahead=10:sync-lookahead=0:bframes=0:ref=1:sliced-threads=0" -crf 22 -pix_fmt yuv420p "' + norm + '"', { timeout: 180000 });
+
+    // 5) optional background music bed (low volume under the VO)
+    let musicPath = null;
+    if (musicTrack) {
+      const cand = [path.join(__dirname, musicTrack + '.mp3'), path.join(__dirname, 'music', musicTrack + '.mp3')];
+      musicPath = cand.find(p => { try { return fs.existsSync(p); } catch(e){ return false; } }) || null;
+    }
+
+    // 6) mux: loop video to VO duration, VO as main audio (+ quiet music bed if present)
+    const out = path.join(tempDir, 'final.mp4');
+    if (musicPath) {
+      execSync('"' + ffmpegPath + '" -y -stream_loop -1 -i "' + norm + '" -i "' + voPath + '" -stream_loop -1 -i "' + musicPath + '" -filter_complex "[1:a]volume=1.0[vo];[2:a]volume=0.18[mus];[vo][mus]amix=inputs=2:duration=first:dropout_transition=0[a]" -map 0:v -map "[a]" -t ' + voDur.toFixed(2) + ' -c:v libx264 -preset ultrafast -threads 1 -crf 22 -pix_fmt yuv420p -c:a aac -b:a 192k "' + out + '"', { timeout: 180000 });
+    } else {
+      execSync('"' + ffmpegPath + '" -y -stream_loop -1 -i "' + norm + '" -i "' + voPath + '" -map 0:v -map 1:a -t ' + voDur.toFixed(2) + ' -c:v libx264 -preset ultrafast -threads 1 -crf 22 -pix_fmt yuv420p -c:a aac -b:a 192k "' + out + '"', { timeout: 180000 });
+    }
+
+    // 7) store + return
+    const vidId = 'vid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    const finalPath = path.join(os.tmpdir(), vidId + '.mp4');
+    fs.copyFileSync(out, finalPath);
+    const sz = fs.statSync(finalPath).size;
+    outputStore[vidId] = { path: finalPath, size: sz, created: Date.now() };
+    let videoData = null;
+    if (sz < 20 * 1024 * 1024) videoData = 'data:video/mp4;base64,' + fs.readFileSync(finalPath).toString('base64');
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(e) {}
+    console.log('Spokesperson video ready', vidId, Math.round(sz/1024) + 'KB', voDur.toFixed(1)+'s');
+    res.json({ videoId: vidId, size: sz, videoData });
+  } catch (e) {
+    try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(_e) {}
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ---- Stock footage preview: returns candidate clips per scene for review/replace ----
 app.post('/api/stock/preview', async (req, res) => {
   try {
@@ -1360,7 +1435,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.67.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.68.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -1993,7 +2068,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.67.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.68.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -2008,7 +2083,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.67.0 error:', e.message);
+    console.error('Slides v8.68.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -2075,7 +2150,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.67.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.68.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
