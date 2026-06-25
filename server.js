@@ -153,7 +153,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.68.0',
+    version: '8.69.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -1435,7 +1435,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.68.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.69.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -2068,7 +2068,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.68.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.69.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -2083,7 +2083,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.68.0 error:', e.message);
+    console.error('Slides v8.69.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -2093,17 +2093,34 @@ print(f'done:{idx}')
 // ===== VOICES: ElevenLabs voice list =====
 app.get('/api/voice/list', async (req, res) => {
   try {
-    const r = await fetch('https://api.elevenlabs.io/v2/voices?page_size=50', {
+    const r = await fetch('https://api.elevenlabs.io/v2/voices?page_size=80', {
       headers: { 'xi-api-key': ELEVENLABS_KEY }
     });
     const data = await r.json();
     const voices = data.voices || data.results || [];
-    res.json({ voices: voices.map(v => ({
-      voice_id: v.voice_id,
-      name: v.name,
-      preview_url: v.preview_url,
-      labels: v.labels || {}
-    }))});
+    const mapped = voices.map(v => {
+      const L = v.labels || {};
+      const descr = [L.age, L.gender, L.descriptive || L.use_case, L.accent].filter(Boolean).join(' · ');
+      // score: prefer young + energetic/casual/social for a lively brand voice
+      let score = 0;
+      const blob = (JSON.stringify(L) + ' ' + (v.name||'')).toLowerCase();
+      if (blob.includes('young')) score += 3;
+      if (blob.includes('energetic') || blob.includes('upbeat') || blob.includes('excited')) score += 3;
+      if (blob.includes('casual') || blob.includes('social') || blob.includes('conversational')) score += 2;
+      if (blob.includes('middle') || blob.includes('mature') || blob.includes('old')) score -= 3;
+      return {
+        voice_id: v.voice_id,
+        name: v.name,
+        preview_url: v.preview_url,
+        gender: (L.gender || '').toLowerCase(),
+        age: (L.age || '').toLowerCase(),
+        descr: descr,
+        score: score,
+        labels: L
+      };
+    });
+    mapped.sort((a,b) => b.score - a.score);
+    res.json({ voices: mapped });
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
@@ -2150,7 +2167,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.68.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.69.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
