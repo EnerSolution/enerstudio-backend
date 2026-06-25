@@ -153,7 +153,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.70.0',
+    version: '8.71.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -182,6 +182,139 @@ app.post('/api/pilot/signup', (req, res) => {
 app.get('/api/pilot/signups', (req, res) => {
   if ((req.query.key || '') !== 'ener2026') return res.status(403).json({ error: 'forbidden' });
   res.json({ count: pilotSignups.length, signups: pilotSignups });
+});
+
+// ════════════════════════════════════════════════════════════════
+// AUTO-PILOT CONTENT ENGINE
+// Scheduled auto-creation of on-brand videos + captions, queued for
+// member approval, then teed up for one-tap manual upload to socials.
+// Storage is in-memory + file (Render free tier is ephemeral; schedules
+// also persist client-side in localStorage and re-sync on load).
+// ════════════════════════════════════════════════════════════════
+const autoSchedules = {};   // scheduleId -> { id, userEmail, brand, brandBrief, videoType, aspect, frequency, theme, platforms, nextRun, active, lastRun }
+const contentQueue = {};    // itemId -> { id, scheduleId, userEmail, brand, videoType, status, caption, script, videoId, videoData, platforms, createdAt }
+const AUTOFILE = path.join(os.tmpdir(), 'enerstudio_auto.json');
+function saveAuto(){ try { fs.writeFileSync(AUTOFILE, JSON.stringify({ autoSchedules, contentQueue })); } catch(e){} }
+function loadAuto(){ try { if (fs.existsSync(AUTOFILE)) { const d = JSON.parse(fs.readFileSync(AUTOFILE,'utf8')); Object.assign(autoSchedules, d.autoSchedules||{}); Object.assign(contentQueue, d.contentQueue||{}); } } catch(e){} }
+loadAuto();
+
+function freqToMs(freq){
+  switch(freq){
+    case 'daily': return 24*60*60*1000;
+    case 'everyother': return 48*60*60*1000;
+    case 'weekly': return 7*24*60*60*1000;
+    case 'monthly': return 30*24*60*60*1000;
+    default: return 7*24*60*60*1000;
+  }
+}
+
+// Create or update a schedule
+app.post('/api/auto/schedule', (req, res) => {
+  try {
+    let { id, userEmail, brand, brandBrief, videoType, aspect, frequency, theme, platforms, startNow } = req.body || {};
+    if (!userEmail || !brand || !videoType || !frequency) return res.status(400).json({ error: 'userEmail, brand, videoType, frequency required' });
+    const sid = id || ('sch_' + Date.now() + '_' + Math.random().toString(36).slice(2,7));
+    const now = Date.now();
+    autoSchedules[sid] = {
+      id: sid, userEmail, brand, brandBrief: brandBrief || '', videoType, aspect: aspect || 'vertical',
+      frequency, theme: theme || '', platforms: platforms || [], active: true,
+      nextRun: startNow ? now : now + freqToMs(frequency),
+      lastRun: autoSchedules[sid] ? autoSchedules[sid].lastRun : null,
+      createdAt: autoSchedules[sid] ? autoSchedules[sid].createdAt : now
+    };
+    saveAuto();
+    res.json({ ok: true, schedule: autoSchedules[sid] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// List schedules for a user
+app.get('/api/auto/schedules', (req, res) => {
+  const email = (req.query.email || '').toLowerCase();
+  const list = Object.values(autoSchedules).filter(s => !email || (s.userEmail||'').toLowerCase() === email);
+  res.json({ schedules: list });
+});
+
+// Pause/resume/delete a schedule
+app.post('/api/auto/schedule/:id/:action', (req, res) => {
+  const s = autoSchedules[req.params.id];
+  if (!s) return res.status(404).json({ error: 'not found' });
+  const a = req.params.action;
+  if (a === 'pause') s.active = false;
+  else if (a === 'resume') { s.active = true; s.nextRun = Date.now() + freqToMs(s.frequency); }
+  else if (a === 'delete') { delete autoSchedules[req.params.id]; }
+  else if (a === 'runnow') { s.nextRun = Date.now(); s.active = true; }
+  saveAuto();
+  res.json({ ok: true });
+});
+
+// List queue items for a user
+app.get('/api/auto/queue', (req, res) => {
+  const email = (req.query.email || '').toLowerCase();
+  const list = Object.values(contentQueue)
+    .filter(i => !email || (i.userEmail||'').toLowerCase() === email)
+    .sort((a,b) => b.createdAt - a.createdAt);
+  res.json({ items: list });
+});
+
+// Update a queue item (edit caption / mark approved or posted)
+app.post('/api/auto/queue/:id/:action', (req, res) => {
+  const it = contentQueue[req.params.id];
+  if (!it) return res.status(404).json({ error: 'not found' });
+  const a = req.params.action;
+  if (a === 'caption') it.caption = (req.body && req.body.caption) || it.caption;
+  else if (a === 'approve') it.status = 'approved';
+  else if (a === 'posted') it.status = 'posted';
+  else if (a === 'discard') { delete contentQueue[req.params.id]; }
+  saveAuto();
+  res.json({ ok: true, item: contentQueue[req.params.id] || null });
+});
+
+// Generate an AI caption for a piece of content (fresh, on-brand, per platform)
+async function generateCaption(brand, brandBrief, videoType, theme, platform){
+  if (!ANTHROPIC_KEY) return '';
+  const sys = 'You write short, scroll-stopping social media captions for a brand. Output ONLY the caption text (no quotes, no preamble). Include a hook, one line of value, a soft call-to-action, and 3-6 relevant hashtags at the end.';
+  let user = 'Brand: ' + brand + '\nVideo type: ' + videoType + '\nPlatform: ' + (platform||'social') + '\n';
+  if (theme) user += 'Theme/topic: ' + theme + '\n';
+  if (brandBrief) user += '\nBrand context:\n' + brandBrief + '\n';
+  user += '\nWrite ONE fresh caption tailored to ' + (platform||'social media') + '. Keep it natural and human.';
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST', headers: { 'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01' },
+      body: JSON.stringify({ model:'claude-sonnet-4-5', max_tokens:400, system:sys, messages:[{role:'user',content:user}] })
+    });
+    const d = await r.json();
+    return (d && d.content && d.content[0] && d.content[0].text) ? d.content[0].text.trim() : '';
+  } catch(e){ return ''; }
+}
+
+// CRON endpoint — hit by an external pinger (UptimeRobot / cron-job.org) on a schedule.
+// Finds due schedules, creates a queue item with a fresh caption, advances nextRun.
+// Note: video generation itself is kicked off client-side on approval to keep this fast/cheap;
+// here we prepare the brief + caption so the member is notified to create/approve.
+app.all('/api/auto/cron', async (req, res) => {
+  if ((req.query.key || '') !== 'ener2026') return res.status(403).json({ error: 'forbidden' });
+  const now = Date.now();
+  const due = Object.values(autoSchedules).filter(s => s.active && s.nextRun <= now);
+  const created = [];
+  for (const s of due) {
+    try {
+      const platform = (s.platforms && s.platforms[0]) || 'social';
+      // eslint-disable-next-line no-await-in-loop
+      const caption = await generateCaption(s.brand, s.brandBrief, s.videoType, s.theme, platform);
+      const itemId = 'q_' + Date.now() + '_' + Math.random().toString(36).slice(2,7);
+      contentQueue[itemId] = {
+        id: itemId, scheduleId: s.id, userEmail: s.userEmail, brand: s.brand,
+        videoType: s.videoType, aspect: s.aspect, theme: s.theme, platforms: s.platforms,
+        status: 'pending_create', caption: caption, script: '', videoId: null, videoData: null,
+        createdAt: now
+      };
+      s.lastRun = now;
+      s.nextRun = now + freqToMs(s.frequency);
+      created.push(itemId);
+    } catch(e) { /* skip this one */ }
+  }
+  saveAuto();
+  res.json({ ok: true, dueCount: due.length, created });
 });
 
 app.post('/api/claude/generate', async (req, res) => {
@@ -1435,7 +1568,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.70.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.71.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -2068,7 +2201,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.70.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.71.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -2083,7 +2216,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.70.0 error:', e.message);
+    console.error('Slides v8.71.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -2167,7 +2300,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.70.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.71.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
