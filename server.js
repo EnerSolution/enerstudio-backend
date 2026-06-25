@@ -153,7 +153,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.66.0',
+    version: '8.67.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -934,6 +934,40 @@ async function getHeyGenVoiceId(preferGender) {
   } catch (e) { return null; }
 }
 
+// Return a curated list of quality English HeyGen voices (with preview audio) for the picker
+app.get('/api/heygen/voices', async (req, res) => {
+  if (!HEYGEN_KEY) return res.status(400).json({ error: 'HeyGen not configured' });
+  try {
+    if (!_heygenVoices) {
+      const vr = await fetch('https://api.heygen.com/v2/voices', { headers: { 'X-Api-Key': HEYGEN_KEY } });
+      _heygenVoices = vr.ok ? (((await vr.json()).data || {}).voices || []) : [];
+    }
+    const eng = _heygenVoices.filter(v => (v.language || '').toLowerCase().includes('english') && (v.preview_audio || v.preview_url));
+    // pick a friendly spread: prefer ones tagged as natural/friendly, cap the list
+    const seen = {};
+    const curated = [];
+    eng.forEach(function(v){
+      const g = (v.gender || '').toLowerCase();
+      const key = (v.name || '') + g;
+      if (seen[key]) return; seen[key] = 1;
+      curated.push({
+        voice_id: v.voice_id,
+        name: v.name || 'Voice',
+        gender: g,
+        preview: v.preview_audio || v.preview_url || '',
+        tags: (v.emotion_support ? 'expressive' : '') 
+      });
+    });
+    // balance male/female, cap ~16
+    const males = curated.filter(v=>v.gender==='male').slice(0,8);
+    const females = curated.filter(v=>v.gender==='female').slice(0,8);
+    const list = females.concat(males);
+    res.json({ voices: list });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/heygen/generate', async (req, res) => {
   if (!HEYGEN_KEY) return res.status(400).json({ error: 'HeyGen not configured' });
   try {
@@ -1067,7 +1101,7 @@ app.get('/api/heygen/character/:genId', async (req, res) => {
 app.post('/api/heygen/talkingphoto', async (req, res) => {
   if (!HEYGEN_KEY) return res.status(400).json({ error: 'HeyGen not configured' });
   try {
-    let { photo, photoUrl, script, gender, aspect } = req.body;
+    let { photo, photoUrl, script, gender, aspect, voiceId } = req.body;
     if ((!photo && !photoUrl) || !script) return res.status(400).json({ error: 'a photo (or photoUrl) and script are required' });
 
     // 1) get image bytes — from uploaded base64, or by fetching the AI-generated character URL
@@ -1094,8 +1128,8 @@ app.post('/api/heygen/talkingphoto', async (req, res) => {
       return res.status(502).json({ error: 'Photo upload failed: ' + JSON.stringify(upData).slice(0, 250) });
     }
 
-    // 2) pick a valid HeyGen voice
-    const hgVoice = await getHeyGenVoiceId((gender || '').toLowerCase());
+    // 2) pick a valid HeyGen voice — use the explicitly chosen voice if provided
+    const hgVoice = voiceId || await getHeyGenVoiceId((gender || '').toLowerCase());
     if (!hgVoice) return res.status(502).json({ error: 'No HeyGen voice available on this account' });
 
     const dim = (aspect === 'vertical') ? { width: 720, height: 1280 }
@@ -1326,7 +1360,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.66.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.67.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -1959,7 +1993,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.66.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.67.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -1974,7 +2008,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.66.0 error:', e.message);
+    console.error('Slides v8.67.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -2041,7 +2075,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.66.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.67.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
