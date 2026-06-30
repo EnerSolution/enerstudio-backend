@@ -16,7 +16,53 @@ const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY;
 const PEXELS_KEY = process.env.PEXELS_API_KEY;
 const HEYGEN_KEY = process.env.HEYGEN_API_KEY;
 
+// ── STRIPE (subscriptions, card-up-front trial) ──
+const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY;       // sk_test_... (set in Render env)
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET; // whsec_... (set after creating webhook)
+let stripe = null;
+try { if (STRIPE_SECRET) stripe = require('stripe')(STRIPE_SECRET); } catch(e) { console.warn('Stripe init skipped:', e.message); }
+
+// Map plan+cycle -> Stripe Price ID (TEST mode)
+const STRIPE_PRICES = {
+  starter_monthly:  'price_1To5raCyFSpMy8Dm8YLeM8cd',
+  starter_annual:   'price_1To5vACyFSpMy8DmSNtbpzba',
+  pro_monthly:      'price_1To5xOCyFSpMy8Dmmsb9Wja6',
+  pro_annual:       'price_1To5yHCyFSpMy8DmlaRr6ep6',
+  business_monthly: 'price_1To5zwCyFSpMy8DmTy0YFaRw',
+  business_annual:  'price_1To5zwCyFSpMy8DmzapjU8SF'
+};
+const TRIAL_DAYS = 7;
+
 app.use(cors({ origin: '*' }));
+
+// ── STRIPE WEBHOOK (must receive RAW body, so mount BEFORE express.json) ──
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.status(200).json({ received: true, note: 'stripe not configured' });
+  let event;
+  try {
+    const sig = req.headers['stripe-signature'];
+    event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send('Webhook Error: ' + err.message);
+  }
+  // Handle the key subscription lifecycle events
+  try {
+    const obj = event.data && event.data.object ? event.data.object : {};
+    if (event.type === 'checkout.session.completed') {
+      console.log('✅ Checkout completed:', obj.customer_email || obj.customer, '| sub:', obj.subscription);
+      // (Optional) persist subscription status keyed by client_reference_id (the user's uid)
+    } else if (event.type === 'customer.subscription.created' || event.type === 'customer.subscription.updated') {
+      console.log('Subscription', event.type, obj.id, 'status:', obj.status);
+    } else if (event.type === 'invoice.paid') {
+      console.log('💰 Invoice paid:', obj.customer_email || obj.customer);
+    } else if (event.type === 'customer.subscription.deleted') {
+      console.log('Subscription cancelled:', obj.id);
+    }
+  } catch (e) { console.warn('webhook handler error', e.message); }
+  res.json({ received: true });
+});
+
 app.use(express.json({ limit: '50mb' }));
 
 // ── VIDEO OUTPUT STORE (bypasses Render 30s timeout) ──────────────────────
@@ -153,7 +199,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.74.0',
+    version: '8.75.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -325,6 +371,42 @@ app.all('/api/auto/cron', async (req, res) => {
   }
   saveAuto();
   res.json({ ok: true, dueCount: due.length, created });
+});
+
+// ── STRIPE: create a Checkout Session (card up front, 7-day trial) ──
+app.post('/api/stripe/create-checkout', async (req, res) => {
+  try {
+    if (!stripe) return res.status(503).json({ error: 'Payments are not configured yet. Please try again shortly.' });
+    const { plan, cycle, email, uid, successUrl, cancelUrl } = req.body || {};
+    const key = (plan || '') + '_' + (cycle || '');
+    const priceId = STRIPE_PRICES[key];
+    if (!priceId) return res.status(400).json({ error: 'Unknown plan/cycle: ' + key });
+    const origin = (req.headers.origin) || 'https://app.enerstudio.io';
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      payment_method_types: ['card'],
+      line_items: [{ price: priceId, quantity: 1 }],
+      subscription_data: { trial_period_days: TRIAL_DAYS },
+      customer_email: email || undefined,
+      client_reference_id: uid || undefined,
+      allow_promotion_codes: true,
+      success_url: (successUrl || (origin + '/?checkout=success')) + '&session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: cancelUrl || (origin + '/?checkout=cancel')
+    });
+    res.json({ url: session.url, id: session.id });
+  } catch (e) {
+    console.error('create-checkout error', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Expose safe Stripe config (publishable key) to the front-end
+app.get('/api/stripe/config', (req, res) => {
+  res.json({
+    enabled: !!stripe,
+    publishableKey: 'pk_test_51To5hgCyFSpMy8DmlmYajXtSCCmNWnfKf4LPiueCCbbWTASJgQk2oYxZmmbRxcYuJznRDW4T8oUU0uwLwBPUmwQX00NnhcrwG1',
+    trialDays: TRIAL_DAYS
+  });
 });
 
 app.post('/api/claude/generate', async (req, res) => {
@@ -1578,7 +1660,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.74.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.75.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -2211,7 +2293,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.74.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.75.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -2226,7 +2308,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.74.0 error:', e.message);
+    console.error('Slides v8.75.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -2310,7 +2392,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.74.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.75.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
