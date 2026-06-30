@@ -199,7 +199,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.75.0',
+    version: '8.76.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -1660,7 +1660,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.75.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.76.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -2293,7 +2293,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.75.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.76.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -2308,7 +2308,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.75.0 error:', e.message);
+    console.error('Slides v8.76.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -2392,7 +2392,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.75.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.76.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
