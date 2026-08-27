@@ -16,27 +16,69 @@ const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY;
 const PEXELS_KEY = process.env.PEXELS_API_KEY;
 const HEYGEN_KEY = process.env.HEYGEN_API_KEY;
 
-// ── STRIPE (subscriptions, card-up-front trial) ──
-const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY;       // sk_test_... (set in Render env)
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET; // whsec_... (set after creating webhook)
+// ── STRIPE (subscriptions, card-up-front trial) — LIVE MODE ──
+const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY;       // sk_live_... (set in Render env)
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET; // whsec_... (live webhook signing secret, set in Render env)
 let stripe = null;
 try { if (STRIPE_SECRET) stripe = require('stripe')(STRIPE_SECRET); } catch(e) { console.warn('Stripe init skipped:', e.message); }
 
-// Map plan+cycle -> Stripe Price ID (TEST mode)
+// Map plan+cycle -> Stripe Price ID (LIVE mode)
 const STRIPE_PRICES = {
-  starter_monthly:  'price_1To5raCyFSpMy8Dm8YLeM8cd',
-  starter_annual:   'price_1To5vACyFSpMy8DmSNtbpzba',
-  pro_monthly:      'price_1To5xOCyFSpMy8Dmmsb9Wja6',
-  pro_annual:       'price_1To5yHCyFSpMy8DmlaRr6ep6',
-  business_monthly: 'price_1To5zwCyFSpMy8DmTy0YFaRw',
-  business_annual:  'price_1To5zwCyFSpMy8DmzapjU8SF'
+  starter_monthly:  'price_1TvjDrCgPveo3ZNuuyXHqZ5c',
+  starter_annual:   'price_1TvjDrCgPveo3ZNu98taIzlP',
+  pro_monthly:      'price_1TvjDrCgPveo3ZNuyTLdUECF',
+  pro_annual:       'price_1TvjDrCgPveo3ZNuEY2NKG3T',
+  business_monthly: 'price_1TvjDrCgPveo3ZNuD5fmmO6N',
+  business_annual:  'price_1TvjDrCgPveo3ZNutGJ1RT16'
 };
+const STRIPE_PUBLISHABLE = process.env.STRIPE_PUBLISHABLE_KEY || 'pk_live_51To5hMCgPveo3ZNuVu0rxaCNlX7vD2LxbRXo6Ra0emPO0KC6af09osJVr8S4cVIiCiDqlPDRZjrjKV3cdfLlrD9U00yu279ugH';
 const TRIAL_DAYS = 7;
+
+// ── SUPABASE ADMIN (webhook records each member's subscription in their profile) ──
+const SUPABASE_URL_ADMIN = 'https://xksxgvzozmivpigwcecw.supabase.co';
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE; // service_role key — Render env ONLY, never in client code
+async function sbAdminPatchProfile(filterField, filterValue, patch) {
+  if (!SUPABASE_SERVICE_ROLE || !filterValue) return false;
+  try {
+    const url = SUPABASE_URL_ADMIN + '/rest/v1/profiles?' + filterField + '=eq.' + encodeURIComponent(filterValue);
+    const r = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        apikey: SUPABASE_SERVICE_ROLE,
+        Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal'
+      },
+      body: JSON.stringify(patch)
+    });
+    if (!r.ok) console.warn('profile patch failed:', r.status, await r.text().catch(function(){return '';}));
+    return r.ok;
+  } catch (e) { console.warn('profile patch error:', e.message); return false; }
+}
+async function sbAdminGetProfileField(uid, field) {
+  if (!SUPABASE_SERVICE_ROLE || !uid) return null;
+  try {
+    const r = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles?id=eq.' + encodeURIComponent(uid) + '&select=' + field, {
+      headers: { apikey: SUPABASE_SERVICE_ROLE, Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE }
+    });
+    const rows = await r.json();
+    return (Array.isArray(rows) && rows[0]) ? (rows[0][field] || null) : null;
+  } catch (e) { return null; }
+}
+function planFromPriceId(priceId) {
+  for (const k in STRIPE_PRICES) {
+    if (STRIPE_PRICES[k] === priceId) {
+      const parts = k.split('_');
+      return { plan: parts[0], cycle: parts[1] };
+    }
+  }
+  return { plan: null, cycle: null };
+}
 
 app.use(cors({ origin: '*' }));
 
 // ── STRIPE WEBHOOK (must receive RAW body, so mount BEFORE express.json) ──
-app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), (req, res) => {
+app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.status(200).json({ received: true, note: 'stripe not configured' });
   let event;
   try {
@@ -46,18 +88,43 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), (req,
     console.error('Webhook signature verification failed:', err.message);
     return res.status(400).send('Webhook Error: ' + err.message);
   }
-  // Handle the key subscription lifecycle events
+  // Handle the key subscription lifecycle events — and RECORD them in Supabase profiles
   try {
     const obj = event.data && event.data.object ? event.data.object : {};
     if (event.type === 'checkout.session.completed') {
       console.log('✅ Checkout completed:', obj.customer_email || obj.customer, '| sub:', obj.subscription);
-      // (Optional) persist subscription status keyed by client_reference_id (the user's uid)
+      const uid = obj.client_reference_id;
+      if (uid) {
+        const patch = { stripe_customer: obj.customer || null, stripe_subscription: obj.subscription || null, sub_status: 'trialing' };
+        try {
+          if (obj.subscription) {
+            const sub = await stripe.subscriptions.retrieve(obj.subscription);
+            patch.sub_status = sub.status;
+            const priceId = (sub.items && sub.items.data && sub.items.data[0] && sub.items.data[0].price) ? sub.items.data[0].price.id : null;
+            const pc = planFromPriceId(priceId);
+            if (pc.plan) { patch.plan = pc.plan; patch.sub_cycle = pc.cycle; }
+            if (sub.current_period_end) patch.current_period_end = new Date(sub.current_period_end * 1000).toISOString();
+          }
+        } catch (e) { console.warn('sub retrieve:', e.message); }
+        await sbAdminPatchProfile('id', uid, patch);
+      }
     } else if (event.type === 'customer.subscription.created' || event.type === 'customer.subscription.updated') {
       console.log('Subscription', event.type, obj.id, 'status:', obj.status);
+      const patch = { sub_status: obj.status, stripe_subscription: obj.id };
+      const priceId = (obj.items && obj.items.data && obj.items.data[0] && obj.items.data[0].price) ? obj.items.data[0].price.id : null;
+      const pc = planFromPriceId(priceId);
+      if (pc.plan) { patch.plan = pc.plan; patch.sub_cycle = pc.cycle; }
+      if (obj.current_period_end) patch.current_period_end = new Date(obj.current_period_end * 1000).toISOString();
+      await sbAdminPatchProfile('stripe_customer', obj.customer, patch);
     } else if (event.type === 'invoice.paid') {
       console.log('💰 Invoice paid:', obj.customer_email || obj.customer);
+      await sbAdminPatchProfile('stripe_customer', obj.customer, { sub_status: 'active' });
+    } else if (event.type === 'invoice.payment_failed') {
+      console.warn('⚠️ Invoice payment FAILED:', obj.customer_email || obj.customer);
+      await sbAdminPatchProfile('stripe_customer', obj.customer, { sub_status: 'past_due' });
     } else if (event.type === 'customer.subscription.deleted') {
       console.log('Subscription cancelled:', obj.id);
+      await sbAdminPatchProfile('stripe_customer', obj.customer, { sub_status: 'canceled' });
     }
   } catch (e) { console.warn('webhook handler error', e.message); }
   res.json({ received: true });
@@ -199,7 +266,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.78.0',
+    version: '8.80.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -421,9 +488,32 @@ app.post('/api/stripe/create-checkout', async (req, res) => {
 app.get('/api/stripe/config', (req, res) => {
   res.json({
     enabled: !!stripe,
-    publishableKey: 'pk_test_51To5hgCyFSpMy8DmlmYajXtSCCmNWnfKf4LPiueCCbbWTASJgQk2oYxZmmbRxcYuJznRDW4T8oUU0uwLwBPUmwQX00NnhcrwG1',
+    publishableKey: STRIPE_PUBLISHABLE,
     trialDays: TRIAL_DAYS
   });
+});
+
+// ── STRIPE: customer billing portal (members manage their card / invoices / cancel) ──
+app.post('/api/stripe/portal', async (req, res) => {
+  try {
+    if (!stripe) return res.status(503).json({ error: 'Payments are not configured yet.' });
+    const { uid, email, returnUrl } = req.body || {};
+    let customerId = null;
+    if (uid) customerId = await sbAdminGetProfileField(uid, 'stripe_customer');
+    if (!customerId && email) {
+      const found = await stripe.customers.list({ email: email, limit: 1 });
+      if (found && found.data && found.data[0]) customerId = found.data[0].id;
+    }
+    if (!customerId) return res.status(404).json({ error: 'No billing account found for this member yet.' });
+    const portal = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: returnUrl || 'https://app.enerstudio.io'
+    });
+    res.json({ url: portal.url });
+  } catch (e) {
+    console.error('portal error', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.post('/api/claude/generate', async (req, res) => {
@@ -1677,7 +1767,7 @@ app.post('/api/slides/animate', async (req, res) => {
     const PAL = palette || { bg_dark:'#0B1F3A', bg_mid:'#10314F', accent:'#3B82F6',
       accent2:'#2563EB', text:'#FFFFFF', text_soft:'#BFD4EA', ink:'#0B1F3A' };
     const [W, H] = (aspect === 'vertical') ? [1080, 1920] : (aspect === 'square') ? [1080, 1080] : [1280, 720];
-    console.log('Slides v8.78.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
+    console.log('Slides v8.80.0:', slides.length, (videoType||'slides'), W+'x'+H, audioMode||'music', 'stock='+(stockMode||'none'), 'pythonReady='+pythonReady);
 
     // ── AUDIO-FIRST (voice mode): generate per-slide voiceover, measure each, time slides to it ──
     let audioFile = null;
@@ -2310,7 +2400,7 @@ print(f'done:{idx}')
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
-    console.log('Slides v8.78.0 ready:', fileSize, 'bytes, id:', videoId);
+    console.log('Slides v8.80.0 ready:', fileSize, 'bytes, id:', videoId);
     // Quick-fix: also return the video inline as base64 so the browser has it
     // immediately and download works even if the backend later sleeps/restarts.
     // (Skip inline for very large files to avoid memory issues; fall back to URL.)
@@ -2325,7 +2415,7 @@ print(f'done:{idx}')
     res.json({ videoId, downloadUrl:'/api/video/'+videoId, size:fileSize, slides:slides.length, videoData });
 
   } catch(e) {
-    console.error('Slides v8.78.0 error:', e.message);
+    console.error('Slides v8.80.0 error:', e.message);
     res.status(500).json({ error: e.message });
   } finally {
     try { fs.rmSync(tempDir,{recursive:true,force:true}); } catch(e) {}
@@ -2409,7 +2499,7 @@ function ensurePythonPackages() {
 setTimeout(() => ensurePythonPackages(), 1000);
 
 app.listen(PORT, function() {
-  console.log('EnerStudio Backend v8.78.0 running on port ' + PORT);
+  console.log('EnerStudio Backend v8.80.0 running on port ' + PORT);
   console.log('FFmpeg path:', ffmpegPath);
   console.log('ANTHROPIC_KEY:', ANTHROPIC_KEY ? 'SET' : 'MISSING');
   console.log('RUNWAY_KEY:', RUNWAY_KEY ? 'SET' : 'MISSING');
