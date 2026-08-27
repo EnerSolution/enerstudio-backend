@@ -266,7 +266,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.80.0',
+    version: '8.80.1',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -282,12 +282,17 @@ const SUPABASE_URL_KA = 'https://xksxgvzozmivpigwcecw.supabase.co';
 const SUPABASE_ANON_KA = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inhrc3hndnpvem1pdnBpZ3djZWN3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI3NTcyODMsImV4cCI6MjA5ODMzMzI4M30.7IKJruPqAKoiLGHrNzaVK7xRJd5JqeMIRYvQbGoipiw';
 app.get('/api/keepalive', async (req, res) => {
   try {
-    const r = await fetch(SUPABASE_URL_KA + '/auth/v1/health', {
-      headers: { apikey: SUPABASE_ANON_KA }
+    // Run a REAL (tiny) database query — health endpoints don't count as activity
+    // for Supabase's auto-pause logic, but a PostgREST query does. RLS means the
+    // anon key gets an empty result; the query itself is what keeps the project active.
+    const r = await fetch(SUPABASE_URL_KA + '/rest/v1/profiles?select=id&limit=1', {
+      headers: { apikey: SUPABASE_ANON_KA, Authorization: 'Bearer ' + SUPABASE_ANON_KA }
     });
+    if (!r.ok) throw new Error('supabase responded ' + r.status);
     res.json({ ok: true, supabase: r.status, t: Date.now() });
   } catch (e) {
-    res.status(200).json({ ok: false, error: String(e && e.message || e), t: Date.now() });
+    // Report FAILURE with a 500 so UptimeRobot turns red instead of staying green
+    res.status(500).json({ ok: false, error: String(e && e.message || e), t: Date.now() });
   }
 });
 
