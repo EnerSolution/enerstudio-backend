@@ -266,7 +266,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.80.1',
+    version: '8.83.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -295,6 +295,50 @@ app.get('/api/keepalive', async (req, res) => {
     res.status(500).json({ ok: false, error: String(e && e.message || e), t: Date.now() });
   }
 });
+
+// ── FREE-TIER WATERMARK ──
+// Stamps "Made with EnerStudio.io" (bottom-right) onto videos made by free (no-card) accounts.
+// The PNG is drawn by Python/PIL (ffmpeg-static has no drawtext); ffmpeg overlays it.
+// On ANY failure the original video is returned untouched — rendering never breaks.
+function applyFreeWatermark(videoPath) {
+  const stamp = Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+  const wmPng = path.join(os.tmpdir(), 'wm_' + stamp + '.png');
+  const wmPy = path.join(os.tmpdir(), 'wm_' + stamp + '.py');
+  const outPath = path.join(os.tmpdir(), 'wmv_' + stamp + '.mp4');
+  try {
+    fs.writeFileSync(wmPy, [
+      "from PIL import Image, ImageDraw, ImageFont",
+      "import glob",
+      "def pick(*names):",
+      "    fl=glob.glob('/usr/share/fonts/**/*.ttf',recursive=True)",
+      "    for n in names:",
+      "        for p in fl:",
+      "            if n in p: return p",
+      "    return fl[0] if fl else None",
+      "fp=pick('DejaVuSans-Bold','LiberationSans-Bold','Bold')",
+      "f=ImageFont.truetype(fp,34) if fp else ImageFont.load_default()",
+      "t='Made with EnerStudio.io'",
+      "tmp=Image.new('RGBA',(10,10),(0,0,0,0)); d=ImageDraw.Draw(tmp)",
+      "b=d.textbbox((0,0),t,font=f); w=b[2]-b[0]; h=b[3]-b[1]; p=14",
+      "img=Image.new('RGBA',(w+p*2,h+p*2),(0,0,0,0)); d=ImageDraw.Draw(img)",
+      "d.rounded_rectangle([0,0,w+p*2-1,h+p*2-1],radius=12,fill=(0,0,0,115))",
+      "d.text((p-b[0],p-b[1]),t,font=f,fill=(255,255,255,235))",
+      "img.save('" + wmPng.replace(/\\/g, '/') + "')"
+    ].join('\n'));
+    execSync('python3 "' + wmPy + '"', { timeout: 30000 });
+    if (!fs.existsSync(wmPng)) throw new Error('png not created');
+    execSync('"' + ffmpegPath + '" -y -i "' + videoPath + '" -i "' + wmPng + '" -filter_complex "[0:v][1:v]overlay=main_w-overlay_w-18:main_h-overlay_h-18:format=auto,format=yuv420p[out]" -map "[out]" -map 0:a? -c:v libx264 -preset ultrafast -threads 1 -crf 23 -pix_fmt yuv420p -c:a copy "' + outPath + '"', { timeout: 300000 });
+    if (!fs.existsSync(outPath) || fs.statSync(outPath).size < 1000) throw new Error('output invalid');
+    console.log('Free-tier watermark applied');
+    return outPath;
+  } catch (e) {
+    console.log('Watermark skipped:', e && e.message);
+    return videoPath;
+  } finally {
+    try { fs.unlinkSync(wmPng); } catch (e) {}
+    try { fs.unlinkSync(wmPy); } catch (e) {}
+  }
+}
 
 // ── PILOT SIGNUP CAPTURE ──
 // Records who started the pilot. Logged to console (persists in Render logs) and
@@ -905,6 +949,7 @@ app.post('/api/runway/stitch', async (req, res) => {
 
     const videoId = 'cin_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
     const outputPath = path.join(os.tmpdir(), videoId + '.mp4');
+    if (req.body && req.body.freeTier === true) finalPath = applyFreeWatermark(finalPath);
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path: outputPath, size: fileSize, created: Date.now() };
@@ -1142,6 +1187,7 @@ print(f'done:{total_frames}')
     // Save to outputStore (bypasses 30s HTTP timeout)
     const videoId = 'wb_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
     const outputPath = path.join(os.tmpdir(), videoId+'.mp4');
+    if (req.body && req.body.freeTier === true) finalPath = applyFreeWatermark(finalPath);
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
@@ -1653,6 +1699,7 @@ print('ov ok')
     // 5) store + return
     const vid = 'vid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
     const finalPath = path.join(os.tmpdir(), vid + '.mp4');
+    if (req.body && req.body.freeTier === true) finalV = applyFreeWatermark(finalV);
     fs.copyFileSync(finalV, finalPath);
     const sz = fs.statSync(finalPath).size;
     outputStore[vid] = { path: finalPath, size: sz, created: Date.now() };
@@ -1728,7 +1775,7 @@ app.post('/api/spokesperson/finalize', async (req, res) => {
     // 7) store + return
     const vidId = 'vid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
     const finalPath = path.join(os.tmpdir(), vidId + '.mp4');
-    fs.copyFileSync(out, finalPath);
+    fs.copyFileSync((req.body && req.body.freeTier === true) ? applyFreeWatermark(out) : out, finalPath);
     const sz = fs.statSync(finalPath).size;
     outputStore[vidId] = { path: finalPath, size: sz, created: Date.now() };
     let videoData = null;
@@ -1971,6 +2018,7 @@ print('overlays',len(SLIDES))
         // 6) store + return
         const vid = 'vid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
         const finalPath = path.join(os.tmpdir(), vid + '.mp4');
+        if (req.body && req.body.freeTier === true) finalV = applyFreeWatermark(finalV);
         fs.copyFileSync(finalV, finalPath);
         const sz = fs.statSync(finalPath).size;
         outputStore[vid] = { path: finalPath, size: sz, created: Date.now() };
@@ -2133,6 +2181,7 @@ print('overlays',len(SLIDES))
         // 6) store + return (inline if small enough)
         const vid = 'vid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
         const finalPath = path.join(os.tmpdir(), vid + '.mp4');
+        if (req.body && req.body.freeTier === true) finalV = applyFreeWatermark(finalV);
         fs.copyFileSync(finalV, finalPath);
         const sz = fs.statSync(finalPath).size;
         outputStore[vid] = { path: finalPath, size: sz, created: Date.now() };
@@ -2402,6 +2451,7 @@ print(f'done:{idx}')
 
     const videoId = 'sl_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
     const outputPath = path.join(os.tmpdir(), videoId+'.mp4');
+    if (req.body && req.body.freeTier === true) finalPath = applyFreeWatermark(finalPath);
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
