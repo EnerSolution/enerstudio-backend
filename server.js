@@ -267,7 +267,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.85.0',
+    version: '8.86.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -989,13 +989,21 @@ app.post('/api/runway/stitch', rateLimit(30), requireMember, async (req, res) =>
 
     let finalPath = withText;
 
-    // Add voiceover
+    // Add voiceover — and END the video when the narration ends (no silent tail).
     if (audioFile && fs.existsSync(audioFile)) {
+      // Measure the actual voiceover length from ffmpeg output
+      let voDur = clipFiles.length * 5;
+      try {
+        const probe = execSync('"' + ffmpegPath + '" -i "' + audioFile + '" 2>&1 || true', { encoding: 'utf8' });
+        const m = probe.match(/Duration:\s*(\d+):(\d+):(\d+\.?\d*)/);
+        if (m) voDur = parseInt(m[1]) * 3600 + parseInt(m[2]) * 60 + parseFloat(m[3]);
+      } catch (e) {}
+      // small tail so the last word isn't clipped, but no long dead air
+      const finalDur = (voDur + 0.6).toFixed(2);
       const withAudio = path.join(tempDir, 'final.mp4');
-      const videoDuration = clipFiles.length * 5;
-      execSync('"' + ffmpegPath + '" -i "' + withText + '" -i "' + audioFile + '" -map 0:v -map 1:a -c:v copy -c:a aac -t ' + videoDuration + ' "' + withAudio + '" -y', { timeout: 120000 });
+      execSync('"' + ffmpegPath + '" -i "' + withText + '" -i "' + audioFile + '" -map 0:v -map 1:a -c:v libx264 -preset ultrafast -pix_fmt yuv420p -c:a aac -b:a 192k -t ' + finalDur + ' -shortest "' + withAudio + '" -y', { timeout: 120000 });
       finalPath = withAudio;
-      console.log('Audio added to final video');
+      console.log('Audio matched: video trimmed to voiceover (' + finalDur + 's, no silent tail)');
     } else {
       console.log('No audio file available - sending video without voiceover');
     }
