@@ -243,19 +243,37 @@ app.get('/api/video/:id', (req, res) => {
   const entry = outputStore[req.params.id];
   if (!entry) return res.status(404).json({ error: 'Video not found or expired' });
   if (!fs.existsSync(entry.path)) return res.status(404).json({ error: 'Video file missing' });
+  // Cinematic Pro videos are read TWICE (played in the page + uploaded to the permanent Library),
+  // so they must play inline and must NOT be deleted after the first read — a timed sweep cleans them.
+  const isCp = String(req.params.id).indexOf('cp_') === 0;
   res.set('Content-Type', 'video/mp4');
-  res.set('Content-Disposition', 'attachment; filename="enerstudio-whiteboard.mp4"');
+  res.set('Content-Disposition', (isCp ? 'inline' : 'attachment') + '; filename="enerstudio.mp4"');
   res.set('Content-Length', entry.size);
+  res.set('Accept-Ranges', 'bytes');
   const stream = fs.createReadStream(entry.path);
   stream.pipe(res);
-  // Clean up after download
-  stream.on('end', () => {
-    setTimeout(() => {
-      try { fs.unlinkSync(entry.path); } catch(e) {}
-      delete outputStore[req.params.id];
-    }, 5000);
-  });
+  if (!isCp) {
+    // Non-cinematic types are one-shot downloads: clean up after the first read.
+    stream.on('end', () => {
+      setTimeout(() => {
+        try { fs.unlinkSync(entry.path); } catch(e) {}
+        delete outputStore[req.params.id];
+      }, 5000);
+    });
+  }
 });
+// Sweep finished Cinematic Pro files after 30 min (enough time to play + save to the cloud Library).
+setInterval(function(){
+  try {
+    const now = Date.now();
+    Object.keys(outputStore).forEach(function(k){
+      if (k.indexOf('cp_') === 0 && outputStore[k] && (now - (outputStore[k].created || 0)) > 30 * 60 * 1000) {
+        try { fs.unlinkSync(outputStore[k].path); } catch(e) {}
+        delete outputStore[k];
+      }
+    });
+  } catch(e) {}
+}, 5 * 60 * 1000);
 
 // Status check endpoint — app polls this while video is processing
 app.get('/api/video/:id/status', (req, res) => {
@@ -268,7 +286,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.91.0',
+    version: '8.92.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -642,22 +660,31 @@ function cpFindVid(o){
   } catch(e){}
   return null;
 }
-// Download the finished video, watermark if free tier, store for delivery, cache by generation id
+// Download the finished video, watermark if free tier, store for delivery, cache by generation id.
+// Returns just a small videoId (the browser streams the file from /api/video/<id> — NEVER a giant
+// base64 blob, which used to break delivery and overflow the Library's storage).
 async function cpFinalize(id, vurl, freeTier){
-  const vr = await fetch(vurl);
-  const buf = Buffer.from(await vr.arrayBuffer());
-  const videoId = 'cp_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
-  let outPath = path.join(os.tmpdir(), videoId + '.mp4');
-  fs.writeFileSync(outPath, buf);
-  if (freeTier) { try { outPath = applyFreeWatermark(outPath); } catch (e) {} }
-  const sz = fs.statSync(outPath).size;
-  outputStore[videoId] = { path: outPath, size: sz, created: Date.now() };
-  let videoData = null;
-  try { if (sz < 20 * 1024 * 1024) videoData = 'data:video/mp4;base64,' + fs.readFileSync(outPath).toString('base64'); } catch (e) {}
-  cinProCache[id] = { done: true, videoId: videoId, videoData: videoData };
-  cpPush({ phase: 'captured', id: id, videoId: videoId, kb: Math.round(sz/1024) });
-  console.log('Cinematic Pro captured', id, '->', videoId, Math.round(sz/1024)+'KB');
-  return cinProCache[id];
+  // Guard: never download the same generation twice (the status poll and the background capturer race).
+  if (cinProCache[id] && (cinProCache[id].done || cinProCache[id].finalizing)) return cinProCache[id];
+  cinProCache[id] = Object.assign({}, cinProCache[id], { finalizing: true });
+  try {
+    const vr = await fetch(vurl);
+    const buf = Buffer.from(await vr.arrayBuffer());
+    const videoId = 'cp_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+    let outPath = path.join(os.tmpdir(), videoId + '.mp4');
+    fs.writeFileSync(outPath, buf);
+    if (freeTier) { try { outPath = applyFreeWatermark(outPath); } catch (e) {} }
+    const sz = fs.statSync(outPath).size;
+    outputStore[videoId] = { path: outPath, size: sz, created: Date.now() };
+    cinProCache[id] = { done: true, videoId: videoId };
+    cpPush({ phase: 'captured', id: id, videoId: videoId, kb: Math.round(sz/1024) });
+    console.log('Cinematic Pro captured', id, '->', videoId, Math.round(sz/1024)+'KB');
+    return cinProCache[id];
+  } catch (e) {
+    cinProCache[id] = Object.assign({}, cinProCache[id], { finalizing: false });
+    cpPush({ phase: 'finalize_err', id: id, err: e.message });
+    throw e;
+  }
 }
 // Background poller — runs on the server regardless of whether the browser is still watching.
 async function cpCapture(id, freeTier){
@@ -706,7 +733,7 @@ app.get('/api/cinematicpro/status', requireMember, async (req, res) => {
     const id = req.query.id;
     const freeTier = (req.query.freeTier === 'true');
     if (!id) return res.status(400).json({ error: 'id required' });
-    if (cinProCache[id] && cinProCache[id].done) return res.json({ status: 'completed', videoId: cinProCache[id].videoId, videoData: cinProCache[id].videoData });
+    if (cinProCache[id] && cinProCache[id].done) return res.json({ status: 'completed', videoId: cinProCache[id].videoId });
     const r = await fetch('https://api.aimlapi.com/v2/video/generations?generation_id=' + encodeURIComponent(id), { headers: { 'Authorization': 'Bearer ' + AIMLAPI_KEY } });
     const d = await r.json().catch(function(){ return {}; });
     const rawStatus = (d && (d.status || d.state)) ? String(d.status || d.state).toLowerCase() : '';
@@ -716,8 +743,11 @@ app.get('/api/cinematicpro/status', requireMember, async (req, res) => {
       return res.json({ status: 'error', error: (d && d.error) ? JSON.stringify(d.error).slice(0,200) : 'generation error' });
     }
     if (!vurl) return res.json({ status: rawStatus || 'generating' });
-    const out = await cpFinalize(id, vurl, freeTier);
-    res.json({ status: 'completed', videoId: out.videoId, videoData: out.videoData });
+    // Completed on AIMLAPI. Don't block this request downloading ~10MB — kick the (deduped) download and
+    // tell the client we're finalizing; the next poll gets the cached videoId instantly.
+    if (cinProCache[id] && cinProCache[id].done) return res.json({ status: 'completed', videoId: cinProCache[id].videoId });
+    cpFinalize(id, vurl, freeTier).catch(function(){});
+    res.json({ status: 'finalizing' });
   } catch (e) { cpPush({ phase: 'status_exception', err: e.message }); res.status(500).json({ error: e.message }); }
 });
 
