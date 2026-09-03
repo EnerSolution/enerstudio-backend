@@ -268,7 +268,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.87.0',
+    version: '8.88.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -661,12 +661,30 @@ app.get('/api/cinematicpro/status', requireMember, async (req, res) => {
       headers: { 'Authorization': 'Bearer ' + AIMLAPI_KEY }
     });
     const d = await r.json().catch(function(){ return {}; });
-    const status = (d && d.status) ? d.status : 'generating';
-    if (status === 'error') return res.json({ status: 'error', error: (d && d.error) ? JSON.stringify(d.error).slice(0,200) : 'generation error' });
-    if (status !== 'completed') return res.json({ status: status });
-    const vurl = (d.video && d.video.url) ? d.video.url : (d.url || null);
-    if (!vurl) return res.json({ status: 'generating' });
-    // download, watermark if free tier, store for delivery
+    const rawStatus = (d && (d.status || d.state)) ? String(d.status || d.state).toLowerCase() : '';
+    // Robustly find the finished video URL anywhere in the response
+    function findVid(o){
+      try {
+        if (!o) return null;
+        if (o.video && o.video.url) return o.video.url;
+        if (o.video_url) return o.video_url;
+        if (o.output && typeof o.output === 'string' && /\.mp4/.test(o.output)) return o.output;
+        if (o.url && /\.mp4/.test(o.url)) return o.url;
+        const str = JSON.stringify(o);
+        const m = str.match(/https?:\/\/[^"'\s\\]+\.mp4[^"'\s\\]*/);
+        if (m) return m[0];
+      } catch(e){}
+      return null;
+    }
+    if (rawStatus === 'error' || rawStatus === 'failed') {
+      return res.json({ status: 'error', error: (d && d.error) ? JSON.stringify(d.error).slice(0,200) : 'generation error' });
+    }
+    const vurl = findVid(d);
+    if (!vurl) {
+      // still working — echo the raw status so the client/logs can see progress
+      return res.json({ status: rawStatus || 'generating' });
+    }
+    // We have a finished video URL — download, watermark if free tier, store for delivery
     const vr = await fetch(vurl);
     const buf = Buffer.from(await vr.arrayBuffer());
     const videoId = 'cp_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
@@ -678,6 +696,7 @@ app.get('/api/cinematicpro/status', requireMember, async (req, res) => {
     let videoData = null;
     try { if (sz < 20 * 1024 * 1024) videoData = 'data:video/mp4;base64,' + fs.readFileSync(outPath).toString('base64'); } catch (e) {}
     cinProCache[id] = { done: true, videoId: videoId, videoData: videoData };
+    console.log('Cinematic Pro completed', id, '->', videoId, Math.round(sz/1024)+'KB');
     res.json({ status: 'completed', videoId: videoId, videoData: videoData });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
