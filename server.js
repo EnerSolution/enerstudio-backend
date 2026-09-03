@@ -245,14 +245,17 @@ app.get('/api/video/:id', (req, res) => {
   if (!fs.existsSync(entry.path)) return res.status(404).json({ error: 'Video file missing' });
   // Cinematic Pro videos are read TWICE (played in the page + uploaded to the permanent Library),
   // so they must play inline and must NOT be deleted after the first read — a timed sweep cleans them.
+  // "keep" entries (the wizard sample) are inline and never auto-deleted. ?dl=1 forces a download.
   const isCp = String(req.params.id).indexOf('cp_') === 0;
+  const keep = !!entry.keep;
+  const oneShot = !isCp && !keep;
   res.set('Content-Type', 'video/mp4');
-  res.set('Content-Disposition', (isCp ? 'inline' : 'attachment') + '; filename="enerstudio.mp4"');
+  res.set('Content-Disposition', (req.query.dl || oneShot ? 'attachment' : 'inline') + '; filename="enerstudio.mp4"');
   res.set('Content-Length', entry.size);
   res.set('Accept-Ranges', 'bytes');
   const stream = fs.createReadStream(entry.path);
   stream.pipe(res);
-  if (!isCp) {
+  if (oneShot) {
     // Non-cinematic types are one-shot downloads: clean up after the first read.
     stream.on('end', () => {
       setTimeout(() => {
@@ -263,11 +266,12 @@ app.get('/api/video/:id', (req, res) => {
   }
 });
 // Sweep finished Cinematic Pro files after 30 min (enough time to play + save to the cloud Library).
+// Never sweep "keep" entries (the wizard sample).
 setInterval(function(){
   try {
     const now = Date.now();
     Object.keys(outputStore).forEach(function(k){
-      if (k.indexOf('cp_') === 0 && outputStore[k] && (now - (outputStore[k].created || 0)) > 30 * 60 * 1000) {
+      if (k.indexOf('cp_') === 0 && outputStore[k] && !outputStore[k].keep && (now - (outputStore[k].created || 0)) > 30 * 60 * 1000) {
         try { fs.unlinkSync(outputStore[k].path); } catch(e) {}
         delete outputStore[k];
       }
@@ -286,7 +290,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.92.0',
+    version: '8.93.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -755,6 +759,68 @@ app.get('/api/cinematicpro/status', requireMember, async (req, res) => {
 app.get('/api/cinematicpro/debug', (req, res) => {
   if (!ADMIN_KEY || (req.query.key || '') !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
   res.json({ count: cinProDebug.length, entries: cinProDebug.slice(-40) });
+});
+
+// ── WIZARD SAMPLE CLIP (admin-only, one-time) ──
+// Generates ONE clean (no-watermark) Google Veo 3.1 clip to use as the wizard's auto-play showcase.
+// This runs only when the admin triggers it — it NEVER fires on signups, so it can't leak credits.
+let cpSample = { genId: null, videoId: null };
+const CP_SAMPLE_PROMPT = "Ultra-realistic cinematic vertical commercial for a professional home energy and insulation company. Open on a confident contractor in a clean branded uniform inspecting a bright modern attic with warm natural light, then cut to a beautiful cozy finished living room and a happy family. Smooth cinematic camera movement, shallow depth of field, premium color grading, realistic people and real environments. A warm, confident professional male voiceover says: 'Upgrade your home. Cut your energy bills. Trusted local experts — book your free assessment today.' Subtle uplifting background music. Photorealistic and believable, like a real filmed television commercial — not animated, not cartoonish, not obviously AI. End on a clean modern title card.";
+async function cpCaptureSample(id){
+  for (let i = 0; i < 90; i++) {
+    await new Promise(function(r){ setTimeout(r, 10000); });
+    if (cpSample.videoId) return;
+    try {
+      const r = await fetch('https://api.aimlapi.com/v2/video/generations?generation_id=' + encodeURIComponent(id), { headers: { 'Authorization': 'Bearer ' + AIMLAPI_KEY } });
+      const d = await r.json().catch(function(){ return {}; });
+      const st = (d && (d.status || d.state)) ? String(d.status || d.state).toLowerCase() : '';
+      const vurl = cpFindVid(d);
+      cpPush({ phase: 'sample_bg', i: i, http: r.status, status: st, hasVid: !!vurl, resp: JSON.stringify(d).slice(0, 500) });
+      if (st === 'error' || st === 'failed') { cpPush({ phase: 'sample_errored', id: id }); return; }
+      if (vurl) {
+        const vr = await fetch(vurl);
+        const buf = Buffer.from(await vr.arrayBuffer());
+        const videoId = 'sample_cinematic';
+        const outPath = path.join(os.tmpdir(), videoId + '.mp4');
+        fs.writeFileSync(outPath, buf);
+        outputStore[videoId] = { path: outPath, size: fs.statSync(outPath).size, created: Date.now(), keep: true };
+        cpSample.videoId = videoId;
+        cpPush({ phase: 'sample_captured', videoId: videoId, kb: Math.round(outputStore[videoId].size / 1024) });
+        return;
+      }
+    } catch (e) { cpPush({ phase: 'sample_bg_exception', err: e.message }); }
+  }
+  cpPush({ phase: 'sample_bg_timeout', id: id });
+}
+app.get('/api/cinematicpro/sample', async (req, res) => {
+  try {
+    if (!ADMIN_KEY || (req.query.key || '') !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
+    if (!AIMLAPI_KEY) return res.status(503).json({ error: 'not configured' });
+    // Already finished? return the watch + download links.
+    if (cpSample.videoId && outputStore[cpSample.videoId]) {
+      return res.json({ status: 'ready', videoId: cpSample.videoId, watch: '/api/video/' + cpSample.videoId, download: '/api/video/' + cpSample.videoId + '?dl=1' });
+    }
+    // In progress? tell the admin to refresh.
+    if (cpSample.genId) {
+      return res.json({ status: 'generating', id: cpSample.genId, note: 'Still filming (Veo takes ~1-3 min). Refresh this URL in a minute.' });
+    }
+    // ?reset=1 lets the admin re-generate a new sample later.
+    if (req.query.reset === '1') { cpSample = { genId: null, videoId: null }; }
+    // Start ONE Veo 3.1 generation (clean, no watermark, vertical, native audio).
+    const prompt = req.query.prompt ? String(req.query.prompt).slice(0, 2000) : CP_SAMPLE_PROMPT;
+    const body = { model: 'google/veo-3.1-t2v', prompt: prompt, aspect_ratio: '9:16', duration: 8, resolution: '720p', generate_audio: true };
+    const r = await fetch('https://api.aimlapi.com/v2/video/generations', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + AIMLAPI_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const d = await r.json().catch(function(){ return {}; });
+    cpPush({ phase: 'sample_start', http: r.status, ok: r.ok, id: (d && d.id) || null, resp: JSON.stringify(d).slice(0, 500) });
+    if (!r.ok || !d.id) return res.status(502).json({ error: (d && (d.error || d.message)) ? JSON.stringify(d.error || d.message).slice(0, 200) : ('AIMLAPI error ' + r.status) });
+    cpSample = { genId: d.id, videoId: null };
+    cpCaptureSample(d.id); // background — the server finishes it even if you close the tab
+    res.json({ status: 'started', id: d.id, note: 'Generating your Veo 3.1 sample (~1-3 min). Refresh this URL to get the watch + download links when ready.' });
+  } catch (e) { cpPush({ phase: 'sample_exception', err: e.message }); res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/claude/generate', rateLimit(30), requireMember, async (req, res) => {
