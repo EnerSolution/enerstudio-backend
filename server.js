@@ -268,7 +268,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.88.0',
+    version: '8.90.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -629,14 +629,16 @@ app.post('/api/cinematicpro/start', rateLimit(20), requireMember, async (req, re
     if (!AIMLAPI_KEY) return res.status(503).json({ error: 'Cinematic Pro is not configured yet.' });
     const { prompt, aspect, freeTier } = req.body || {};
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
-    // Free videos use the cheap-but-cinematic Seedance; paid members get premium Veo 3.1
+    // Free tier = Seedance 1.5 Pro (very cheap, ~$0.10/video) so 3 free videos cost ~$0.30/signup.
+    // Paid = Google Veo 3.1 at 720p ("Lite" tier, ~$0.40/video) — Google-grade quality WITHOUT the $4 4K tier.
+    // Both generate native synchronized audio. Free tier still gets a watermark.
     const model = (freeTier === true) ? 'bytedance/seedance-1-5-pro' : 'google/veo-3.1-t2v';
     const body = {
       model: model,
       prompt: String(prompt).slice(0, 2000),
       aspect_ratio: cpAspect(aspect),
       duration: 8,
-      resolution: '1080p',
+      resolution: '720p',
       generate_audio: true
     };
     const r = await fetch('https://api.aimlapi.com/v2/video/generations', {
