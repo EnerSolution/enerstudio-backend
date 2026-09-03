@@ -249,8 +249,9 @@ app.get('/api/video/:id', (req, res) => {
   const isCp = String(req.params.id).indexOf('cp_') === 0;
   const keep = !!entry.keep;
   const oneShot = !isCp && !keep;
-  res.set('Content-Type', 'video/mp4');
-  res.set('Content-Disposition', (req.query.dl || oneShot ? 'attachment' : 'inline') + '; filename="enerstudio.mp4"');
+  const ext = entry.mp3 ? 'mp3' : 'mp4';
+  res.set('Content-Type', entry.mp3 ? 'audio/mpeg' : 'video/mp4');
+  res.set('Content-Disposition', (req.query.dl || oneShot ? 'attachment' : 'inline') + '; filename="' + String(req.params.id).replace(/[^a-zA-Z0-9_-]/g,'') + '.' + ext + '"');
   res.set('Content-Length', entry.size);
   res.set('Accept-Ranges', 'bytes');
   const stream = fs.createReadStream(entry.path);
@@ -290,7 +291,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.93.0',
+    version: '8.94.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -821,6 +822,88 @@ app.get('/api/cinematicpro/sample', async (req, res) => {
     cpCaptureSample(d.id); // background — the server finishes it even if you close the tab
     res.json({ status: 'started', id: d.id, note: 'Generating your Veo 3.1 sample (~1-3 min). Refresh this URL to get the watch + download links when ready.' });
   } catch (e) { cpPush({ phase: 'sample_exception', err: e.message }); res.status(500).json({ error: e.message }); }
+});
+
+// ── PROMO ASSETS (admin-only, one-time) ──
+// Generates the 2 NEW silent Veo scenes + one continuous ElevenLabs voiceover for the ~24s EnerStudio
+// promo. Claude assembles the final video from these downloadable pieces. Admin-triggered only.
+let cpPromo = { state: 'idle', scene1: false, scene2: false, vo: false, error: null };
+const PROMO_VO = "Meet EnerStudio — the A I studio that turns one sentence into a professional video. No camera. No crew. No agency fees. Just describe your idea, and watch it come to life — like this. From cinematic ads to social videos, all made by A I in minutes. In fact, this very video was made with EnerStudio. Start creating today — your first three videos are free.";
+const PROMO_SCENES = [
+  "Ultra-realistic cinematic vertical shot: a young entrepreneur at a sleek modern desk types a single sentence on a glowing laptop, then leans back amazed as a vibrant cinematic video comes to life on a large monitor beside them. Warm creative-studio lighting, soft bokeh, shallow depth of field, premium color grading. Photorealistic, filmed like a real high-end commercial, smooth slow camera push-in. No on-screen text.",
+  "Ultra-realistic cinematic vertical montage: a hand holds a smartphone showing several stunning professional video ads playing one after another, then a happy diverse group of small-business owners smiling in a bright modern office looking at a screen. Dynamic smooth camera motion, premium color grading, photorealistic, filmed like a real television commercial. No on-screen text."
+];
+async function genVeoSilentToStore(prompt, storeId){
+  const body = { model: 'google/veo-3.1-t2v', prompt: String(prompt).slice(0, 2000), aspect_ratio: '9:16', duration: 8, resolution: '720p', generate_audio: false };
+  const r = await fetch('https://api.aimlapi.com/v2/video/generations', { method: 'POST', headers: { 'Authorization': 'Bearer ' + AIMLAPI_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const d = await r.json().catch(function(){ return {}; });
+  cpPush({ phase: 'promo_veo_start', store: storeId, http: r.status, ok: r.ok, id: (d && d.id) || null, resp: JSON.stringify(d).slice(0, 300) });
+  if (!r.ok || !d.id) throw new Error('veo start ' + r.status + ' ' + JSON.stringify(d.error || d.message || '').slice(0,120));
+  for (let i = 0; i < 90; i++) {
+    await new Promise(function(rs){ setTimeout(rs, 10000); });
+    const pr = await fetch('https://api.aimlapi.com/v2/video/generations?generation_id=' + encodeURIComponent(d.id), { headers: { 'Authorization': 'Bearer ' + AIMLAPI_KEY } });
+    const pd = await pr.json().catch(function(){ return {}; });
+    const st = (pd && (pd.status || pd.state)) ? String(pd.status || pd.state).toLowerCase() : '';
+    const vurl = cpFindVid(pd);
+    cpPush({ phase: 'promo_veo_poll', store: storeId, i: i, status: st, hasVid: !!vurl });
+    if (st === 'error' || st === 'failed') throw new Error('veo generation error');
+    if (vurl) {
+      const vr = await fetch(vurl);
+      const buf = Buffer.from(await vr.arrayBuffer());
+      const outPath = path.join(os.tmpdir(), storeId + '.mp4');
+      fs.writeFileSync(outPath, buf);
+      outputStore[storeId] = { path: outPath, size: fs.statSync(outPath).size, created: Date.now(), keep: true };
+      cpPush({ phase: 'promo_veo_done', store: storeId, kb: Math.round(outputStore[storeId].size / 1024) });
+      return;
+    }
+  }
+  throw new Error('veo timeout');
+}
+async function genVOToStore(text, storeId){
+  if (!ELEVENLABS_KEY) throw new Error('voice service not configured');
+  const voiceId = 'EXAVITQu4vr4xnSDxMaL'; // Sarah — clear professional voice
+  const vr = await fetch('https://api.elevenlabs.io/v1/text-to-speech/' + voiceId, {
+    method: 'POST',
+    headers: { 'xi-api-key': ELEVENLABS_KEY, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
+    body: JSON.stringify({ text: text, model_id: 'eleven_multilingual_v2', voice_settings: { stability: 0.5, similarity_boost: 0.75 } })
+  });
+  if (!vr.ok) throw new Error('tts ' + vr.status);
+  const buf = Buffer.from(await vr.arrayBuffer());
+  const outPath = path.join(os.tmpdir(), storeId + '.mp3');
+  fs.writeFileSync(outPath, buf);
+  outputStore[storeId] = { path: outPath, size: fs.statSync(outPath).size, created: Date.now(), keep: true, mp3: true };
+  cpPush({ phase: 'promo_vo_done', store: storeId, kb: Math.round(outputStore[storeId].size / 1024) });
+}
+async function buildPromoAssets(){
+  cpPromo.state = 'generating'; cpPromo.error = null;
+  try {
+    await genVeoSilentToStore(PROMO_SCENES[0], 'promo_scene1'); cpPromo.scene1 = true;
+    await genVeoSilentToStore(PROMO_SCENES[1], 'promo_scene2'); cpPromo.scene2 = true;
+    await genVOToStore(PROMO_VO, 'promo_vo'); cpPromo.vo = true;
+    cpPromo.state = 'ready';
+    cpPush({ phase: 'promo_ready' });
+  } catch (e) { cpPromo.state = 'error'; cpPromo.error = e.message; cpPush({ phase: 'promo_error', err: e.message }); }
+}
+app.get('/api/cinematicpro/promo', (req, res) => {
+  if (!ADMIN_KEY || (req.query.key || '') !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
+  if (!AIMLAPI_KEY) return res.status(503).json({ error: 'not configured' });
+  if (req.query.reset === '1') { cpPromo = { state: 'idle', scene1: false, scene2: false, vo: false, error: null }; }
+  if (cpPromo.state === 'ready') {
+    return res.json({ status: 'ready',
+      scene1: '/api/video/promo_scene1?dl=1', scene2: '/api/video/promo_scene2?dl=1',
+      vo: '/api/video/promo_vo?dl=1', contractor: '/api/video/sample_cinematic?dl=1',
+      note: 'Download all four, then Claude assembles the final promo.' });
+  }
+  if (cpPromo.state === 'generating') {
+    return res.json({ status: 'generating', done: { scene1: cpPromo.scene1, scene2: cpPromo.scene2, vo: cpPromo.vo }, note: 'Refresh this URL in ~1-2 min (2 Veo scenes take a few minutes).' });
+  }
+  if (cpPromo.state === 'error') {
+    const err = cpPromo.error; cpPromo.state = 'idle';
+    return res.json({ status: 'error', error: err, note: 'Open this URL again to retry (only unfinished pieces re-generate).' });
+  }
+  cpPromo = { state: 'generating', scene1: false, scene2: false, vo: false, error: null };
+  buildPromoAssets();
+  res.json({ status: 'started', note: 'Generating 2 Veo scenes + voiceover (~4-6 min). Refresh this URL to check progress.' });
 });
 
 app.post('/api/claude/generate', rateLimit(30), requireMember, async (req, res) => {
