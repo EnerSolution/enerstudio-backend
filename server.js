@@ -268,7 +268,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.90.0',
+    version: '8.91.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -619,37 +619,85 @@ app.post('/api/stripe/portal', async (req, res) => {
   }
 });
 
-// ── CINEMATIC PRO (AIMLAPI: Seedance 1.5 Pro for free tier, Google Veo 3.1 for paid) ──
-// These models generate NATIVE synchronized audio, so there is never a silent gap.
+// ── CINEMATIC PRO (AIMLAPI: Seedance 1.5 Pro free tier @1080p, Google Veo 3.1 Lite paid @720p) ──
+// Native synchronized audio → no silent gap. A server-side background capturer fetches the finished
+// video on its own even if the browser has closed, so a generated video (and its credits) is never lost.
 const cinProCache = {}; // generationId -> { done, videoId, videoData }
+const cinProDebug = []; // ring buffer of recent AIMLAPI interactions (read via /api/cinematicpro/debug?key=ADMIN_KEY)
 function cpAspect(a){ return (a === 'vertical') ? '9:16' : (a === 'square' ? '1:1' : '16:9'); }
+function cpPush(entry){
+  try { cinProDebug.push(Object.assign({ t: new Date().toISOString() }, entry)); while (cinProDebug.length > 60) cinProDebug.shift(); } catch (e) {}
+}
+// Robustly find the finished video URL anywhere in an AIMLAPI response
+function cpFindVid(o){
+  try {
+    if (!o) return null;
+    if (o.video && o.video.url) return o.video.url;
+    if (o.video_url) return o.video_url;
+    if (o.output && typeof o.output === 'string' && /\.mp4/.test(o.output)) return o.output;
+    if (o.url && /\.mp4/.test(o.url)) return o.url;
+    const str = JSON.stringify(o);
+    const m = str.match(/https?:\/\/[^"'\s\\]+\.mp4[^"'\s\\]*/);
+    if (m) return m[0];
+  } catch(e){}
+  return null;
+}
+// Download the finished video, watermark if free tier, store for delivery, cache by generation id
+async function cpFinalize(id, vurl, freeTier){
+  const vr = await fetch(vurl);
+  const buf = Buffer.from(await vr.arrayBuffer());
+  const videoId = 'cp_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+  let outPath = path.join(os.tmpdir(), videoId + '.mp4');
+  fs.writeFileSync(outPath, buf);
+  if (freeTier) { try { outPath = applyFreeWatermark(outPath); } catch (e) {} }
+  const sz = fs.statSync(outPath).size;
+  outputStore[videoId] = { path: outPath, size: sz, created: Date.now() };
+  let videoData = null;
+  try { if (sz < 20 * 1024 * 1024) videoData = 'data:video/mp4;base64,' + fs.readFileSync(outPath).toString('base64'); } catch (e) {}
+  cinProCache[id] = { done: true, videoId: videoId, videoData: videoData };
+  cpPush({ phase: 'captured', id: id, videoId: videoId, kb: Math.round(sz/1024) });
+  console.log('Cinematic Pro captured', id, '->', videoId, Math.round(sz/1024)+'KB');
+  return cinProCache[id];
+}
+// Background poller — runs on the server regardless of whether the browser is still watching.
+async function cpCapture(id, freeTier){
+  for (let i = 0; i < 90; i++) {                     // up to 90 * 10s = 15 min
+    await new Promise(function(r){ setTimeout(r, 10000); });
+    if (cinProCache[id] && cinProCache[id].done) return;
+    try {
+      const r = await fetch('https://api.aimlapi.com/v2/video/generations?generation_id=' + encodeURIComponent(id), { headers: { 'Authorization': 'Bearer ' + AIMLAPI_KEY } });
+      const d = await r.json().catch(function(){ return {}; });
+      const st = (d && (d.status || d.state)) ? String(d.status || d.state).toLowerCase() : '';
+      const vurl = cpFindVid(d);
+      cpPush({ phase: 'bg', i: i, http: r.status, status: st, hasVid: !!vurl, resp: JSON.stringify(d).slice(0, 500) });
+      if (st === 'error' || st === 'failed') { cpPush({ phase: 'bg_errored', id: id }); return; }
+      if (vurl) { try { await cpFinalize(id, vurl, freeTier); } catch (e) { cpPush({ phase: 'bg_finalize_err', err: e.message }); } return; }
+    } catch (e) { cpPush({ phase: 'bg_exception', err: e.message }); }
+  }
+  cpPush({ phase: 'bg_timeout', id: id });
+}
 
 app.post('/api/cinematicpro/start', rateLimit(20), requireMember, async (req, res) => {
   try {
     if (!AIMLAPI_KEY) return res.status(503).json({ error: 'Cinematic Pro is not configured yet.' });
     const { prompt, aspect, freeTier } = req.body || {};
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
-    // Free tier = Seedance 1.5 Pro (very cheap, ~$0.10/video) so 3 free videos cost ~$0.30/signup.
-    // Paid = Google Veo 3.1 at 720p ("Lite" tier, ~$0.40/video) — Google-grade quality WITHOUT the $4 4K tier.
-    // Both generate native synchronized audio. Free tier still gets a watermark.
-    const model = (freeTier === true) ? 'bytedance/seedance-1-5-pro' : 'google/veo-3.1-t2v';
-    const body = {
-      model: model,
-      prompt: String(prompt).slice(0, 2000),
-      aspect_ratio: cpAspect(aspect),
-      duration: 8,
-      resolution: '720p',
-      generate_audio: true
-    };
+    const isFree = (freeTier === true);
+    // Free = Seedance 1.5 Pro @1080p (known-good, ~$0.10). Paid = Veo 3.1 @720p (Lite tier, ~$0.40, NOT the $4 4K tier).
+    const model = isFree ? 'bytedance/seedance-1-5-pro' : 'google/veo-3.1-t2v';
+    const resolution = isFree ? '1080p' : '720p';
+    const body = { model: model, prompt: String(prompt).slice(0, 2000), aspect_ratio: cpAspect(aspect), duration: 8, resolution: resolution, generate_audio: true };
     const r = await fetch('https://api.aimlapi.com/v2/video/generations', {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + AIMLAPI_KEY, 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
     const d = await r.json().catch(function(){ return {}; });
+    cpPush({ phase: 'start', http: r.status, ok: r.ok, model: model, resolution: resolution, id: (d && d.id) || null, resp: JSON.stringify(d).slice(0, 500) });
     if (!r.ok || !d.id) return res.status(502).json({ error: (d && (d.error || d.message)) ? JSON.stringify(d.error || d.message).slice(0,200) : ('AIMLAPI error ' + r.status) });
-    res.json({ taskId: d.id, model: model, freeTier: freeTier === true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    cpCapture(d.id, isFree); // fire-and-forget background capture so the finished video is never lost
+    res.json({ taskId: d.id, model: model, freeTier: isFree });
+  } catch (e) { cpPush({ phase: 'start_exception', err: e.message }); res.status(500).json({ error: e.message }); }
 });
 
 app.get('/api/cinematicpro/status', requireMember, async (req, res) => {
@@ -659,48 +707,24 @@ app.get('/api/cinematicpro/status', requireMember, async (req, res) => {
     const freeTier = (req.query.freeTier === 'true');
     if (!id) return res.status(400).json({ error: 'id required' });
     if (cinProCache[id] && cinProCache[id].done) return res.json({ status: 'completed', videoId: cinProCache[id].videoId, videoData: cinProCache[id].videoData });
-    const r = await fetch('https://api.aimlapi.com/v2/video/generations?generation_id=' + encodeURIComponent(id), {
-      headers: { 'Authorization': 'Bearer ' + AIMLAPI_KEY }
-    });
+    const r = await fetch('https://api.aimlapi.com/v2/video/generations?generation_id=' + encodeURIComponent(id), { headers: { 'Authorization': 'Bearer ' + AIMLAPI_KEY } });
     const d = await r.json().catch(function(){ return {}; });
     const rawStatus = (d && (d.status || d.state)) ? String(d.status || d.state).toLowerCase() : '';
-    // Robustly find the finished video URL anywhere in the response
-    function findVid(o){
-      try {
-        if (!o) return null;
-        if (o.video && o.video.url) return o.video.url;
-        if (o.video_url) return o.video_url;
-        if (o.output && typeof o.output === 'string' && /\.mp4/.test(o.output)) return o.output;
-        if (o.url && /\.mp4/.test(o.url)) return o.url;
-        const str = JSON.stringify(o);
-        const m = str.match(/https?:\/\/[^"'\s\\]+\.mp4[^"'\s\\]*/);
-        if (m) return m[0];
-      } catch(e){}
-      return null;
-    }
+    const vurl = cpFindVid(d);
+    cpPush({ phase: 'status', http: r.status, status: rawStatus, hasVid: !!vurl, resp: JSON.stringify(d).slice(0, 500) });
     if (rawStatus === 'error' || rawStatus === 'failed') {
       return res.json({ status: 'error', error: (d && d.error) ? JSON.stringify(d.error).slice(0,200) : 'generation error' });
     }
-    const vurl = findVid(d);
-    if (!vurl) {
-      // still working — echo the raw status so the client/logs can see progress
-      return res.json({ status: rawStatus || 'generating' });
-    }
-    // We have a finished video URL — download, watermark if free tier, store for delivery
-    const vr = await fetch(vurl);
-    const buf = Buffer.from(await vr.arrayBuffer());
-    const videoId = 'cp_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
-    let outPath = path.join(os.tmpdir(), videoId + '.mp4');
-    fs.writeFileSync(outPath, buf);
-    if (freeTier) { try { outPath = applyFreeWatermark(outPath); } catch (e) {} }
-    const sz = fs.statSync(outPath).size;
-    outputStore[videoId] = { path: outPath, size: sz, created: Date.now() };
-    let videoData = null;
-    try { if (sz < 20 * 1024 * 1024) videoData = 'data:video/mp4;base64,' + fs.readFileSync(outPath).toString('base64'); } catch (e) {}
-    cinProCache[id] = { done: true, videoId: videoId, videoData: videoData };
-    console.log('Cinematic Pro completed', id, '->', videoId, Math.round(sz/1024)+'KB');
-    res.json({ status: 'completed', videoId: videoId, videoData: videoData });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    if (!vurl) return res.json({ status: rawStatus || 'generating' });
+    const out = await cpFinalize(id, vurl, freeTier);
+    res.json({ status: 'completed', videoId: out.videoId, videoData: out.videoData });
+  } catch (e) { cpPush({ phase: 'status_exception', err: e.message }); res.status(500).json({ error: e.message }); }
+});
+
+// Private diagnostic — shows exactly what AIMLAPI returned on recent Cinematic Pro runs (admin only).
+app.get('/api/cinematicpro/debug', (req, res) => {
+  if (!ADMIN_KEY || (req.query.key || '') !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
+  res.json({ count: cinProDebug.length, entries: cinProDebug.slice(-40) });
 });
 
 app.post('/api/claude/generate', rateLimit(30), requireMember, async (req, res) => {
