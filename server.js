@@ -291,7 +291,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.94.0',
+    version: '8.95.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -714,8 +714,24 @@ app.post('/api/cinematicpro/start', rateLimit(20), requireMember, async (req, re
     if (!AIMLAPI_KEY) return res.status(503).json({ error: 'Cinematic Pro is not configured yet.' });
     const { prompt, aspect, freeTier } = req.body || {};
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
+    // Cinematic Pro is PAID-ONLY (it runs a costly premium engine). Verify the member is a paying subscriber
+    // server-side so a free account can't bypass the app UI and burn credits. Fails OPEN on a Supabase hiccup
+    // (a definitive "not paid" read blocks; an infra error lets it through so paying customers are never blocked).
+    try {
+      if (SUPABASE_SERVICE_ROLE && req.memberId) {
+        const pr = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles?id=eq.' + encodeURIComponent(req.memberId) + '&select=sub_status', {
+          headers: { apikey: SUPABASE_SERVICE_ROLE, Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE }
+        });
+        if (pr.ok) {
+          const rows = await pr.json();
+          const st = (Array.isArray(rows) && rows[0]) ? rows[0].sub_status : null;
+          const paid = (st === 'trialing' || st === 'active' || st === 'past_due');
+          if (!paid) return res.status(402).json({ error: 'Cinematic Pro is a premium feature — please upgrade to create cinematic videos.' });
+        }
+      }
+    } catch (e) { /* infra error → fail open, never block a paying customer */ }
+    // Paid-only now, so this always uses the premium Veo 3.1 @720p engine (Lite tier). freeTier is kept for watermarking.
     const isFree = (freeTier === true);
-    // Free = Seedance 1.5 Pro @1080p (known-good, ~$0.10). Paid = Veo 3.1 @720p (Lite tier, ~$0.40, NOT the $4 4K tier).
     const model = isFree ? 'bytedance/seedance-1-5-pro' : 'google/veo-3.1-t2v';
     const resolution = isFree ? '1080p' : '720p';
     const body = { model: model, prompt: String(prompt).slice(0, 2000), aspect_ratio: cpAspect(aspect), duration: 8, resolution: resolution, generate_audio: true };
