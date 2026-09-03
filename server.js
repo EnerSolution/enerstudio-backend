@@ -16,6 +16,7 @@ const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY;
 const PEXELS_KEY = process.env.PEXELS_API_KEY;
 const HEYGEN_KEY = process.env.HEYGEN_API_KEY;
 const ADMIN_KEY = process.env.ADMIN_KEY || ''; // private admin/cron key — set in Render env, NEVER in client code
+const AIMLAPI_KEY = process.env.AIMLAPI_KEY || ''; // Cinematic Pro (Veo/Seedance via AIMLAPI) — set in Render env
 
 // ── STRIPE (subscriptions, card-up-front trial) — LIVE MODE ──
 const STRIPE_SECRET = process.env.STRIPE_SECRET_KEY;       // sk_live_... (set in Render env)
@@ -267,7 +268,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.86.0',
+    version: '8.87.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -616,6 +617,69 @@ app.post('/api/stripe/portal', async (req, res) => {
     console.error('portal error', e.message);
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── CINEMATIC PRO (AIMLAPI: Seedance 1.5 Pro for free tier, Google Veo 3.1 for paid) ──
+// These models generate NATIVE synchronized audio, so there is never a silent gap.
+const cinProCache = {}; // generationId -> { done, videoId, videoData }
+function cpAspect(a){ return (a === 'vertical') ? '9:16' : (a === 'square' ? '1:1' : '16:9'); }
+
+app.post('/api/cinematicpro/start', rateLimit(20), requireMember, async (req, res) => {
+  try {
+    if (!AIMLAPI_KEY) return res.status(503).json({ error: 'Cinematic Pro is not configured yet.' });
+    const { prompt, aspect, freeTier } = req.body || {};
+    if (!prompt) return res.status(400).json({ error: 'prompt required' });
+    // Free videos use the cheap-but-cinematic Seedance; paid members get premium Veo 3.1
+    const model = (freeTier === true) ? 'bytedance/seedance-1-5-pro' : 'google/veo-3.1-t2v';
+    const body = {
+      model: model,
+      prompt: String(prompt).slice(0, 2000),
+      aspect_ratio: cpAspect(aspect),
+      duration: 8,
+      resolution: '1080p',
+      generate_audio: true
+    };
+    const r = await fetch('https://api.aimlapi.com/v2/video/generations', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + AIMLAPI_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const d = await r.json().catch(function(){ return {}; });
+    if (!r.ok || !d.id) return res.status(502).json({ error: (d && (d.error || d.message)) ? JSON.stringify(d.error || d.message).slice(0,200) : ('AIMLAPI error ' + r.status) });
+    res.json({ taskId: d.id, model: model, freeTier: freeTier === true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/cinematicpro/status', requireMember, async (req, res) => {
+  try {
+    if (!AIMLAPI_KEY) return res.status(503).json({ error: 'not configured' });
+    const id = req.query.id;
+    const freeTier = (req.query.freeTier === 'true');
+    if (!id) return res.status(400).json({ error: 'id required' });
+    if (cinProCache[id] && cinProCache[id].done) return res.json({ status: 'completed', videoId: cinProCache[id].videoId, videoData: cinProCache[id].videoData });
+    const r = await fetch('https://api.aimlapi.com/v2/video/generations?generation_id=' + encodeURIComponent(id), {
+      headers: { 'Authorization': 'Bearer ' + AIMLAPI_KEY }
+    });
+    const d = await r.json().catch(function(){ return {}; });
+    const status = (d && d.status) ? d.status : 'generating';
+    if (status === 'error') return res.json({ status: 'error', error: (d && d.error) ? JSON.stringify(d.error).slice(0,200) : 'generation error' });
+    if (status !== 'completed') return res.json({ status: status });
+    const vurl = (d.video && d.video.url) ? d.video.url : (d.url || null);
+    if (!vurl) return res.json({ status: 'generating' });
+    // download, watermark if free tier, store for delivery
+    const vr = await fetch(vurl);
+    const buf = Buffer.from(await vr.arrayBuffer());
+    const videoId = 'cp_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+    let outPath = path.join(os.tmpdir(), videoId + '.mp4');
+    fs.writeFileSync(outPath, buf);
+    if (freeTier) { try { outPath = applyFreeWatermark(outPath); } catch (e) {} }
+    const sz = fs.statSync(outPath).size;
+    outputStore[videoId] = { path: outPath, size: sz, created: Date.now() };
+    let videoData = null;
+    try { if (sz < 20 * 1024 * 1024) videoData = 'data:video/mp4;base64,' + fs.readFileSync(outPath).toString('base64'); } catch (e) {}
+    cinProCache[id] = { done: true, videoId: videoId, videoData: videoData };
+    res.json({ status: 'completed', videoId: videoId, videoData: videoData });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/claude/generate', rateLimit(30), requireMember, async (req, res) => {
