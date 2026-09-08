@@ -67,6 +67,62 @@ async function sbAdminGetProfileField(uid, field) {
     return (Array.isArray(rows) && rows[0]) ? (rows[0][field] || null) : null;
   } catch (e) { return null; }
 }
+
+// ── PLAN LIMITS (server-side, authoritative) ──
+// Per-type monthly allowances. avatarMin is counted in MINUTES; everything else in videos.
+// Cheap engines (faceless/quote/slides) are intentionally generous — they cost ~pennies.
+const PLAN_CAPS = {
+  starter:  { cinematic:4,  productad:10, spokesperson:5,  talkingphoto:5,  avatarMin:2, faceless:20,  quote:40 },
+  pro:      { cinematic:8,  productad:25, spokesperson:10, talkingphoto:10, avatarMin:4, faceless:50,  quote:100 },
+  business: { cinematic:16, productad:50, spokesperson:20, talkingphoto:20, avatarMin:8, faceless:120, quote:250 }
+};
+const PAID_STATUSES = ['trialing', 'active', 'past_due'];
+function monthKey(){ return new Date().toISOString().slice(0, 7); } // 'YYYY-MM'
+
+// Check the member's plan + this month's usage for `type`, and consume `amount` if allowed.
+// Returns { ok:true } to proceed, or { ok:false, code, error } to block.
+// Fails OPEN on infrastructure errors so a Supabase blip never blocks a paying customer,
+// but a DEFINITIVE over-cap or not-paid read blocks. Usage lives in profiles.usage (jsonb).
+async function checkAndConsume(memberId, type, amount) {
+  amount = amount || 1;
+  if (!SUPABASE_SERVICE_ROLE || !memberId) return { ok: true }; // not configured → don't block
+  let p;
+  try {
+    const r = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles?id=eq.' + encodeURIComponent(memberId) + '&select=plan,sub_status,usage', {
+      headers: { apikey: SUPABASE_SERVICE_ROLE, Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE }
+    });
+    if (!r.ok) return { ok: true }; // infra error → fail open
+    const rows = await r.json();
+    p = (Array.isArray(rows) && rows[0]) ? rows[0] : null;
+  } catch (e) { return { ok: true }; } // network error → fail open
+  if (!p) return { ok: true };
+  if (!PAID_STATUSES.includes(p.sub_status)) {
+    return { ok: false, code: 402, error: 'This feature requires an active plan. Please upgrade to keep creating.' };
+  }
+  const plan = (p.plan && PLAN_CAPS[p.plan]) ? p.plan : 'starter';
+  const cap = PLAN_CAPS[plan][type];
+  if (cap == null) return { ok: true }; // this type isn't capped
+  const mk = monthKey();
+  let usage = (p.usage && typeof p.usage === 'object' && !Array.isArray(p.usage)) ? p.usage : {};
+  if (usage.__month !== mk) usage = { __month: mk }; // new month → reset all counters
+  const used = usage[type] || 0;
+  if (used + amount > cap) {
+    const unit = (type === 'avatarMin') ? ' minutes' : '';
+    return { ok: false, code: 402, error: 'Monthly limit reached for your ' + plan + ' plan (' + cap + unit + ' of ' + type.replace('avatarMin', 'avatar') + '). Use Plan Refresh or upgrade to keep creating.' };
+  }
+  usage[type] = used + amount;
+  try { await sbAdminPatchProfile('id', memberId, { usage: usage }); } catch (e) { /* best-effort */ }
+  return { ok: true, remaining: cap - usage[type] };
+}
+
+// Admin auth: accept the key via the `x-admin-key` HEADER (preferred, not logged in URLs) or `?key=` (fallback).
+function isAdmin(req) {
+  if (!ADMIN_KEY) return false;
+  const h = (req.headers && req.headers['x-admin-key']) || '';
+  const q = (req.query && req.query.key) || '';
+  return h === ADMIN_KEY || q === ADMIN_KEY;
+}
+
 function planFromPriceId(priceId) {
   for (const k in STRIPE_PRICES) {
     if (STRIPE_PRICES[k] === priceId) {
@@ -77,7 +133,17 @@ function planFromPriceId(priceId) {
   return { plan: null, cycle: null };
 }
 
-app.use(cors({ origin: '*' }));
+// CORS: only allow the EnerStudio front-ends (and non-browser callers like mobile/curl, which send no Origin).
+// This stops other websites from using a logged-in visitor's browser to call the money endpoints.
+const CORS_ALLOW = ['https://enerstudio.io', 'https://www.enerstudio.io', 'https://app.enerstudio.io'];
+app.use(cors({
+  origin: function (origin, cb) {
+    if (!origin) return cb(null, true);                 // mobile app / server-to-server / curl
+    if (CORS_ALLOW.indexOf(origin) !== -1) return cb(null, true);
+    if (/\.vercel\.app$/.test(origin)) return cb(null, true); // Vercel preview deploys
+    return cb(null, false);
+  }
+}));
 
 // ── STRIPE WEBHOOK (must receive RAW body, so mount BEFORE express.json) ──
 app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
@@ -291,7 +357,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.95.0',
+    version: '8.96.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -334,9 +400,10 @@ async function requireMember(req, res, next) {
         headers: { apikey: SUPABASE_ANON_KA, Authorization: 'Bearer ' + token }
       });
     } catch (netErr) {
-      // Supabase unreachable — fail OPEN so a brief blip never blocks paying members. Logged for review.
-      console.warn('requireMember: auth-check network error, allowing through:', netErr && netErr.message);
-      return next();
+      // Supabase unreachable — fail CLOSED. Protecting the AI/credit endpoints from an auth bypass
+      // is more important than a brief blip; 503 is retryable so the app just tries again shortly.
+      console.warn('requireMember: auth-check network error, denying (fail-closed):', netErr && netErr.message);
+      return res.status(503).json({ error: 'Verifying your session — please try again in a moment.' });
     }
     if (r.status === 200) {
       const u = await r.json().catch(() => null);
@@ -437,7 +504,7 @@ app.post('/api/pilot/signup', rateLimit(10), (req, res) => {
 });
 // Admin: list signups captured since last restart
 app.get('/api/pilot/signups', (req, res) => {
-  if (!ADMIN_KEY || (req.query.key || '') !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
+  if (!isAdmin(req)) return res.status(403).json({ error: 'forbidden' });
   res.json({ count: pilotSignups.length, signups: pilotSignups });
 });
 
@@ -642,6 +709,27 @@ app.post('/api/stripe/portal', async (req, res) => {
   }
 });
 
+// ── USAGE / ALLOWANCE — the app reads this to show "X left this month" and to block before spending ──
+app.get('/api/usage', requireMember, async (req, res) => {
+  try {
+    if (!SUPABASE_SERVICE_ROLE) return res.json({ plan: null, paid: false, caps: {}, usage: {}, remaining: {} });
+    const r = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles?id=eq.' + encodeURIComponent(req.memberId) + '&select=plan,sub_status,usage', {
+      headers: { apikey: SUPABASE_SERVICE_ROLE, Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE }
+    });
+    const rows = r.ok ? await r.json() : [];
+    const p = (Array.isArray(rows) && rows[0]) ? rows[0] : {};
+    const paid = PAID_STATUSES.includes(p.sub_status);
+    const plan = (p.plan && PLAN_CAPS[p.plan]) ? p.plan : (paid ? 'starter' : null);
+    const caps = plan ? PLAN_CAPS[plan] : {};
+    const mk = monthKey();
+    let usage = (p.usage && typeof p.usage === 'object' && !Array.isArray(p.usage)) ? p.usage : {};
+    if (usage.__month !== mk) usage = { __month: mk };
+    const remaining = {};
+    for (const k in caps) remaining[k] = Math.max(0, caps[k] - (usage[k] || 0));
+    res.json({ plan: plan, paid: paid, month: mk, caps: caps, usage: usage, remaining: remaining });
+  } catch (e) { res.json({ plan: null, paid: false, caps: {}, usage: {}, remaining: {} }); }
+});
+
 // ── CINEMATIC PRO (AIMLAPI: Seedance 1.5 Pro free tier @1080p, Google Veo 3.1 Lite paid @720p) ──
 // Native synchronized audio → no silent gap. A server-side background capturer fetches the finished
 // video on its own even if the browser has closed, so a generated video (and its credits) is never lost.
@@ -714,22 +802,10 @@ app.post('/api/cinematicpro/start', rateLimit(20), requireMember, async (req, re
     if (!AIMLAPI_KEY) return res.status(503).json({ error: 'Cinematic Pro is not configured yet.' });
     const { prompt, aspect, freeTier } = req.body || {};
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
-    // Cinematic Pro is PAID-ONLY (it runs a costly premium engine). Verify the member is a paying subscriber
-    // server-side so a free account can't bypass the app UI and burn credits. Fails OPEN on a Supabase hiccup
-    // (a definitive "not paid" read blocks; an infra error lets it through so paying customers are never blocked).
-    try {
-      if (SUPABASE_SERVICE_ROLE && req.memberId) {
-        const pr = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles?id=eq.' + encodeURIComponent(req.memberId) + '&select=sub_status', {
-          headers: { apikey: SUPABASE_SERVICE_ROLE, Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE }
-        });
-        if (pr.ok) {
-          const rows = await pr.json();
-          const st = (Array.isArray(rows) && rows[0]) ? rows[0].sub_status : null;
-          const paid = (st === 'trialing' || st === 'active' || st === 'past_due');
-          if (!paid) return res.status(402).json({ error: 'Cinematic Pro is a premium feature — please upgrade to create cinematic videos.' });
-        }
-      }
-    } catch (e) { /* infra error → fail open, never block a paying customer */ }
+    // Cinematic Pro is PAID-ONLY and monthly-capped. checkAndConsume verifies the member is a paying
+    // subscriber AND that they haven't used up this month's cinematic allowance, then consumes 1.
+    const gate = await checkAndConsume(req.memberId, 'cinematic', 1);
+    if (!gate.ok) return res.status(gate.code || 402).json({ error: gate.error });
     // Paid-only now, so this always uses the premium Veo 3.1 @720p engine (Lite tier). freeTier is kept for watermarking.
     const isFree = (freeTier === true);
     const model = isFree ? 'bytedance/seedance-1-5-pro' : 'google/veo-3.1-t2v';
@@ -774,7 +850,7 @@ app.get('/api/cinematicpro/status', requireMember, async (req, res) => {
 
 // Private diagnostic — shows exactly what AIMLAPI returned on recent Cinematic Pro runs (admin only).
 app.get('/api/cinematicpro/debug', (req, res) => {
-  if (!ADMIN_KEY || (req.query.key || '') !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
+  if (!isAdmin(req)) return res.status(403).json({ error: 'forbidden' });
   res.json({ count: cinProDebug.length, entries: cinProDebug.slice(-40) });
 });
 
@@ -811,7 +887,7 @@ async function cpCaptureSample(id){
 }
 app.get('/api/cinematicpro/sample', async (req, res) => {
   try {
-    if (!ADMIN_KEY || (req.query.key || '') !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
+    if (!isAdmin(req)) return res.status(403).json({ error: 'forbidden' });
     if (!AIMLAPI_KEY) return res.status(503).json({ error: 'not configured' });
     // Already finished? return the watch + download links.
     if (cpSample.videoId && outputStore[cpSample.videoId]) {
@@ -901,7 +977,7 @@ async function buildPromoAssets(){
   } catch (e) { cpPromo.state = 'error'; cpPromo.error = e.message; cpPush({ phase: 'promo_error', err: e.message }); }
 }
 app.get('/api/cinematicpro/promo', (req, res) => {
-  if (!ADMIN_KEY || (req.query.key || '') !== ADMIN_KEY) return res.status(403).json({ error: 'forbidden' });
+  if (!isAdmin(req)) return res.status(403).json({ error: 'forbidden' });
   if (!AIMLAPI_KEY) return res.status(503).json({ error: 'not configured' });
   if (req.query.reset === '1') { cpPromo = { state: 'idle', scene1: false, scene2: false, vo: false, error: null }; }
   if (cpPromo.state === 'ready') {
@@ -1721,6 +1797,9 @@ app.post('/api/heygen/generate', rateLimit(30), requireMember, async (req, res) 
   try {
     let { avatarId, script, aspect, gender } = req.body;
     if (!avatarId || !script) return res.status(400).json({ error: 'avatarId and script are required' });
+    // Monthly cap: Talking Avatar is billed in MINUTES. Estimate length from the script (~150 wpm) and consume.
+    const _avMins = Math.max(1, Math.ceil(String(script).trim().split(/\s+/).filter(Boolean).length / 150));
+    { const g = await checkAndConsume(req.memberId, 'avatarMin', _avMins); if (!g.ok) return res.status(g.code || 402).json({ error: g.error }); }
     const dim = (aspect === 'vertical') ? { width: 720, height: 1280 }
               : (aspect === 'square') ? { width: 1080, height: 1080 }
               : { width: 1280, height: 720 };
@@ -1851,6 +1930,7 @@ app.post('/api/heygen/talkingphoto', rateLimit(30), requireMember, async (req, r
   try {
     let { photo, photoUrl, script, gender, aspect, voiceId } = req.body;
     if ((!photo && !photoUrl) || !script) return res.status(400).json({ error: 'a photo (or photoUrl) and script are required' });
+    { const g = await checkAndConsume(req.memberId, 'talkingphoto', 1); if (!g.ok) return res.status(g.code || 402).json({ error: g.error }); }
 
     // 1) get image bytes — from uploaded base64, or by fetching the AI-generated character URL
     let buf, ctype = 'image/jpeg';
@@ -1968,6 +2048,7 @@ app.post('/api/productad/finalize', rateLimit(30), requireMember, async (req, re
   try {
     let { videoUrl, headline, sub, price, palette, aspect, musicTrack } = req.body;
     if (!videoUrl) return res.status(400).json({ error: 'videoUrl required' });
+    { const g = await checkAndConsume(req.memberId, 'productad', 1); if (!g.ok) return res.status(g.code || 402).json({ error: g.error }); }
     const PAL = palette || { bg_dark:'#0B1F3A', accent:'#F4B400', text:'#FFFFFF', text_soft:'#FCD9A8' };
     const dim = (aspect === 'vertical') ? { W:1080, H:1920 } : (aspect === 'square') ? { W:1080, H:1080 } : { W:1280, H:720 };
     const W = dim.W, H = dim.H;
@@ -2086,6 +2167,7 @@ app.post('/api/spokesperson/finalize', rateLimit(30), requireMember, async (req,
   try {
     let { videoUrl, script, voiceId, aspect, musicTrack } = req.body;
     if (!videoUrl || !script) return res.status(400).json({ error: 'videoUrl and script required' });
+    { const g = await checkAndConsume(req.memberId, 'spokesperson', 1); if (!g.ok) return res.status(g.code || 402).json({ error: g.error }); }
     const dim = (aspect === 'vertical') ? { W:1080, H:1920 } : (aspect === 'square') ? { W:1080, H:1080 } : { W:1280, H:720 };
     const W = dim.W, H = dim.H;
 
