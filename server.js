@@ -358,7 +358,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.97.0',
+    version: '8.98.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -775,6 +775,85 @@ app.get('/api/admin/leads', requireMember, async (req, res) => {
     leads.sort(function(a,b){ return String(b.signed_up).localeCompare(String(a.signed_up)); });
     res.json({ count: leads.length, leads: leads });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── EMAIL FOLLOW-UP ENGINE (Resend) — every email is FROM ENZO, the face of EnerStudio ──
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const ENZO_FROM = 'Enzo from EnerStudio <hello@enerstudio.io>';
+const APP_URL = 'https://app.enerstudio.io';
+async function sendEmail(to, subject, html){
+  if (!RESEND_API_KEY) return { ok:false, error:'email not configured (RESEND_API_KEY missing)' };
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method:'POST',
+      headers:{ 'Authorization':'Bearer '+RESEND_API_KEY, 'Content-Type':'application/json' },
+      body: JSON.stringify({ from: ENZO_FROM, to:[to], reply_to: (process.env.REPLY_TO_EMAIL || ADMIN_EMAIL), subject: subject, html: html })
+    });
+    const d = await r.json().catch(function(){ return {}; });
+    return { ok: r.ok, id: d && d.id, error: r.ok ? null : JSON.stringify(d).slice(0,200) };
+  } catch(e){ return { ok:false, error:e.message }; }
+}
+function enzoFrame(inner){
+  return '<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:0 auto;color:#1f2430;font-size:15px;line-height:1.6;">'
+    + inner
+    + '<div style="margin-top:26px;padding-top:16px;border-top:1px solid #eee;color:#8a93a5;font-size:12px;">You’re getting this because you signed up at <a href="https://enerstudio.io" style="color:#10b981;text-decoration:none;">EnerStudio.io</a>. Not interested? Just reply and I’ll take you off the list. — Enzo 🎬</div></div>';
+}
+function enzoBtn(label, color){ return '<p><a href="'+APP_URL+'" style="display:inline-block;background:'+(color||'#6366f1')+';color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-weight:bold;">'+label+'</a></p>'; }
+// Drip schedule — minimum account age (hours) before each email may send. Stops when lead activates or subscribes.
+const ENZO_SEQUENCE = [
+  { stage:1, minAgeHours:1, subject:function(n){ return 'Welcome to EnerStudio 🎬 Let’s make your first video'; },
+    body:function(n){ return '<p>Hi '+n+',</p><p>I’m <b>Enzo</b> from EnerStudio — so glad you joined! 🎬</p><p>You’re all set to make your <b>first video free</b> (no credit card). Just describe what you want in one sentence, and the AI writes, films, and delivers it in minutes.</p>'+enzoBtn('Make your first video →')+'<p>Stuck on anything? Just reply — I’m here to help.</p><p>— Enzo, EnerStudio</p>'; } },
+  { stage:2, minAgeHours:24, subject:function(n){ return 'The fastest video to start with (2 minutes)'; },
+    body:function(n){ return '<p>Hi '+n+',</p><p>Want to see EnerStudio in action? The easiest one to start with is a <b>Cinematic ad</b>: type one sentence about your business, hit generate, and you’ll have a professional video in a couple of minutes.</p><p>Your first <b>3 videos are free</b>.</p>'+enzoBtn('Try it now →')+'<p>— Enzo</p>'; } },
+  { stage:3, minAgeHours:72, subject:function(n){ return 'See what businesses are making with AI'; },
+    body:function(n){ return '<p>Hi '+n+',</p><p>From contractors to restaurants to online stores, businesses are turning <b>one sentence</b> into scroll-stopping videos with EnerStudio — no camera, no editing, no agency.</p><p>You can too, free. What would you make first?</p>'+enzoBtn('Create a video →')+'<p>— Enzo</p>'; } },
+  { stage:4, minAgeHours:120, subject:function(n){ return 'Your 3 free videos are still waiting 🎁'; },
+    body:function(n){ return '<p>Hi '+n+',</p><p>Just a friendly nudge — your <b>3 free videos</b> are still on your account, no credit card needed. It takes about 2 minutes to make one.</p>'+enzoBtn('Claim them →','#10b981')+'<p>— Enzo</p>'; } },
+  { stage:5, minAgeHours:192, subject:function(n){ return 'Can I help you make your first video, '+n+'?'; },
+    body:function(n){ return '<p>Hi '+n+',</p><p>I noticed you haven’t made your first video yet — totally okay! If something got in the way, or you have a question, just <b>reply to this email</b> and I’ll personally help you get your first one done.</p><p>It’s free and takes about 2 minutes.</p>'+enzoBtn('Make your first video →')+'<p>— Enzo</p>'; } }
+];
+// Send the next due Enzo email to leads who haven't activated (0 videos) or subscribed.
+async function runFollowups(){
+  if (!RESEND_API_KEY || !SUPABASE_SERVICE_ROLE) return { ran:false, reason:'not configured (need RESEND_API_KEY)' };
+  let sent = 0, due = 0;
+  try {
+    const ur = await fetch(SUPABASE_URL_ADMIN + '/auth/v1/admin/users?per_page=200', { headers:{ apikey:SUPABASE_SERVICE_ROLE, Authorization:'Bearer '+SUPABASE_SERVICE_ROLE } });
+    const ud = await ur.json().catch(function(){ return {}; });
+    const users = (ud && Array.isArray(ud.users)) ? ud.users : [];
+    let pmap = {};
+    try { const pr = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles?select=id,sub_status,followup', { headers:{ apikey:SUPABASE_SERVICE_ROLE, Authorization:'Bearer '+SUPABASE_SERVICE_ROLE } }); const profs = pr.ok ? await pr.json() : []; (Array.isArray(profs)?profs:[]).forEach(function(p){ pmap[p.id]=p; }); } catch(e){}
+    let vcount = {};
+    try { const lr = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/library?select=user_id,kind', { headers:{ apikey:SUPABASE_SERVICE_ROLE, Authorization:'Bearer '+SUPABASE_SERVICE_ROLE } }); const libs = lr.ok ? await lr.json() : []; (Array.isArray(libs)?libs:[]).forEach(function(r2){ if(r2.kind!=='photo') vcount[r2.user_id]=(vcount[r2.user_id]||0)+1; }); } catch(e){}
+    const now = Date.now();
+    for (const u of users) {
+      const email = (u.email||'').toLowerCase();
+      if (!email || email === ADMIN_EMAIL || email.indexOf('@enerstudio.io') >= 0) continue; // skip admin/test
+      const p = pmap[u.id];
+      if (!p) continue;                                       // no profile row → can't track state safely, skip
+      if (PAID_STATUSES.includes(p.sub_status)) continue;      // subscribed → stop
+      if ((vcount[u.id]||0) > 0) continue;                     // made a video → stop
+      const ageH = (now - new Date(u.created_at||now).getTime()) / 3600000;
+      const fu = (p.followup && typeof p.followup==='object') ? p.followup : {};
+      const doneStage = fu.stage || 0;
+      if (doneStage >= ENZO_SEQUENCE.length) continue;         // finished the sequence
+      const step = ENZO_SEQUENCE[doneStage];                   // next email after doneStage
+      if (!step || ageH < step.minAgeHours) continue;          // not due yet
+      due++;
+      const nm = (u.user_metadata && u.user_metadata.name) ? String(u.user_metadata.name).trim().split(' ')[0] : 'there';
+      const r = await sendEmail(u.email, step.subject(nm), enzoFrame(step.body(nm)));
+      if (r.ok) { sent++; try { await sbAdminPatchProfile('id', u.id, { followup: { stage: step.stage, lastSentAt: new Date().toISOString() } }); } catch(e){} }
+      else { console.warn('follow-up send failed for', email, r.error); }
+    }
+    return { ran:true, due:due, sent:sent };
+  } catch(e){ return { ran:false, error:e.message }; }
+}
+// Auto-run hourly (backend stays warm via keep-alive) + one run ~90s after boot.
+setInterval(function(){ runFollowups().then(function(r){ if(r && r.sent) console.log('Enzo follow-ups sent:', r.sent); }).catch(function(){}); }, 60*60*1000);
+setTimeout(function(){ runFollowups().catch(function(){}); }, 90*1000);
+// Admin: run the engine on demand and see a summary (also lets you verify before trusting the automation).
+app.get('/api/admin/run-followups', requireMember, async (req, res) => {
+  if (!req.memberEmail || req.memberEmail !== ADMIN_EMAIL) return res.status(403).json({ error:'forbidden' });
+  res.json(await runFollowups());
 });
 
 // ── CINEMATIC PRO (AIMLAPI: Seedance 1.5 Pro free tier @1080p, Google Veo 3.1 Lite paid @720p) ──
