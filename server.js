@@ -16,6 +16,7 @@ const ELEVENLABS_KEY = process.env.ELEVENLABS_API_KEY;
 const PEXELS_KEY = process.env.PEXELS_API_KEY;
 const HEYGEN_KEY = process.env.HEYGEN_API_KEY;
 const ADMIN_KEY = process.env.ADMIN_KEY || ''; // private admin/cron key — set in Render env, NEVER in client code
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'enerstudio.io@gmail.com').toLowerCase(); // the account that sees the Admin console
 const AIMLAPI_KEY = process.env.AIMLAPI_KEY || ''; // Cinematic Pro (Veo/Seedance via AIMLAPI) — set in Render env
 
 // ── STRIPE (subscriptions, card-up-front trial) — LIVE MODE ──
@@ -357,7 +358,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.96.0',
+    version: '8.97.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -407,7 +408,7 @@ async function requireMember(req, res, next) {
     }
     if (r.status === 200) {
       const u = await r.json().catch(() => null);
-      if (u && u.id) { req.memberId = u.id; return next(); }
+      if (u && u.id) { req.memberId = u.id; req.memberEmail = (u.email || '').toLowerCase(); return next(); }
     }
     return res.status(401).json({ error: 'Your session expired — please refresh the page and log in again.' });
   } catch (e) {
@@ -728,6 +729,52 @@ app.get('/api/usage', requireMember, async (req, res) => {
     for (const k in caps) remaining[k] = Math.max(0, caps[k] - (usage[k] || 0));
     res.json({ plan: plan, paid: paid, month: mk, caps: caps, usage: usage, remaining: remaining });
   } catch (e) { res.json({ plan: null, paid: false, caps: {}, usage: {}, remaining: {} }); }
+});
+
+// ── ADMIN CONSOLE — LEADS (admin account only) ──
+// Returns every signup with contact info, whether they paid, and how many videos they've made.
+app.get('/api/admin/leads', requireMember, async (req, res) => {
+  try {
+    if (!req.memberEmail || req.memberEmail !== ADMIN_EMAIL) return res.status(403).json({ error: 'forbidden' });
+    if (!SUPABASE_SERVICE_ROLE) return res.status(503).json({ error: 'not configured' });
+    // 1) auth users (contact info lives in user_metadata)
+    const ur = await fetch(SUPABASE_URL_ADMIN + '/auth/v1/admin/users?per_page=200', {
+      headers: { apikey: SUPABASE_SERVICE_ROLE, Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE }
+    });
+    const ud = await ur.json().catch(function(){ return {}; });
+    const users = (ud && Array.isArray(ud.users)) ? ud.users : (Array.isArray(ud) ? ud : []);
+    // 2) profiles (plan / sub_status / usage) keyed by id
+    let pmap = {};
+    try {
+      const pr = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles?select=id,plan,sub_status,sub_cycle,usage', {
+        headers: { apikey: SUPABASE_SERVICE_ROLE, Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE }
+      });
+      const profs = pr.ok ? await pr.json() : [];
+      (Array.isArray(profs) ? profs : []).forEach(function(p){ pmap[p.id] = p; });
+    } catch (e) {}
+    // 3) library video counts keyed by user_id
+    let vcount = {};
+    try {
+      const lr = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/library?select=user_id,kind', {
+        headers: { apikey: SUPABASE_SERVICE_ROLE, Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE }
+      });
+      const libs = lr.ok ? await lr.json() : [];
+      (Array.isArray(libs) ? libs : []).forEach(function(r2){ if (r2.kind !== 'photo') vcount[r2.user_id] = (vcount[r2.user_id] || 0) + 1; });
+    } catch (e) {}
+    const leads = users.map(function(u){
+      const m = u.user_metadata || {};
+      const p = pmap[u.id] || {};
+      const used = (p.usage && typeof p.usage === 'object') ? p.usage : {};
+      return {
+        email: u.email || '', name: m.name || '', company: m.company || '', phone: m.phone || '',
+        signed_up: u.created_at || '', last_login: u.last_sign_in_at || '', confirmed: !!u.email_confirmed_at,
+        plan: p.plan || null, sub_status: p.sub_status || 'free', sub_cycle: p.sub_cycle || null,
+        videos_made: vcount[u.id] || 0, usage: used
+      };
+    });
+    leads.sort(function(a,b){ return String(b.signed_up).localeCompare(String(a.signed_up)); });
+    res.json({ count: leads.length, leads: leads });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── CINEMATIC PRO (AIMLAPI: Seedance 1.5 Pro free tier @1080p, Google Veo 3.1 Lite paid @720p) ──
