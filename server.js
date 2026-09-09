@@ -358,7 +358,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.98.0',
+    version: '8.98.1',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -813,47 +813,60 @@ const ENZO_SEQUENCE = [
     body:function(n){ return '<p>Hi '+n+',</p><p>I noticed you haven’t made your first video yet — totally okay! If something got in the way, or you have a question, just <b>reply to this email</b> and I’ll personally help you get your first one done.</p><p>It’s free and takes about 2 minutes.</p>'+enzoBtn('Make your first video →')+'<p>— Enzo</p>'; } }
 ];
 // Send the next due Enzo email to leads who haven't activated (0 videos) or subscribed.
+const followupDebug = [];
+function fuPush(e){ try{ followupDebug.push(Object.assign({ t:new Date().toISOString() }, e)); while(followupDebug.length>40) followupDebug.shift(); }catch(_){} }
 async function runFollowups(){
-  if (!RESEND_API_KEY || !SUPABASE_SERVICE_ROLE) return { ran:false, reason:'not configured (need RESEND_API_KEY)' };
+  if (!RESEND_API_KEY || !SUPABASE_SERVICE_ROLE) { fuPush({ phase:'skip_config', hasResend:!!RESEND_API_KEY, hasServiceRole:!!SUPABASE_SERVICE_ROLE }); return { ran:false, reason:'not configured (need RESEND_API_KEY)' }; }
   let sent = 0, due = 0;
+  const skip = { admin:0, noProfile:0, paid:0, activated:0, doneSeq:0, notDue:0 };
   try {
     const ur = await fetch(SUPABASE_URL_ADMIN + '/auth/v1/admin/users?per_page=200', { headers:{ apikey:SUPABASE_SERVICE_ROLE, Authorization:'Bearer '+SUPABASE_SERVICE_ROLE } });
     const ud = await ur.json().catch(function(){ return {}; });
-    const users = (ud && Array.isArray(ud.users)) ? ud.users : [];
-    let pmap = {};
-    try { const pr = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles?select=id,sub_status,followup', { headers:{ apikey:SUPABASE_SERVICE_ROLE, Authorization:'Bearer '+SUPABASE_SERVICE_ROLE } }); const profs = pr.ok ? await pr.json() : []; (Array.isArray(profs)?profs:[]).forEach(function(p){ pmap[p.id]=p; }); } catch(e){}
+    const users = (ud && Array.isArray(ud.users)) ? ud.users : (Array.isArray(ud) ? ud : []);
+    fuPush({ phase:'users', http: ur.status, count: users.length, rawKeys: (ud && typeof ud==='object' && !Array.isArray(ud)) ? Object.keys(ud).slice(0,8) : 'array' });
+    let pmap = {}; let profHttp = 0;
+    try { const pr = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles?select=id,sub_status,followup', { headers:{ apikey:SUPABASE_SERVICE_ROLE, Authorization:'Bearer '+SUPABASE_SERVICE_ROLE } }); profHttp = pr.status; const profs = pr.ok ? await pr.json() : []; (Array.isArray(profs)?profs:[]).forEach(function(p){ pmap[p.id]=p; }); } catch(e){}
     let vcount = {};
     try { const lr = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/library?select=user_id,kind', { headers:{ apikey:SUPABASE_SERVICE_ROLE, Authorization:'Bearer '+SUPABASE_SERVICE_ROLE } }); const libs = lr.ok ? await lr.json() : []; (Array.isArray(libs)?libs:[]).forEach(function(r2){ if(r2.kind!=='photo') vcount[r2.user_id]=(vcount[r2.user_id]||0)+1; }); } catch(e){}
+    fuPush({ phase:'data', profilesHttp: profHttp, profilesLoaded: Object.keys(pmap).length });
     const now = Date.now();
     for (const u of users) {
       const email = (u.email||'').toLowerCase();
-      if (!email || email === ADMIN_EMAIL || email.indexOf('@enerstudio.io') >= 0) continue; // skip admin/test
+      if (!email || email === ADMIN_EMAIL || email.indexOf('@enerstudio.io') >= 0) { skip.admin++; continue; }
       const p = pmap[u.id];
-      if (!p) continue;                                       // no profile row → can't track state safely, skip
-      if (PAID_STATUSES.includes(p.sub_status)) continue;      // subscribed → stop
-      if ((vcount[u.id]||0) > 0) continue;                     // made a video → stop
+      if (!p) { skip.noProfile++; continue; }
+      if (PAID_STATUSES.includes(p.sub_status)) { skip.paid++; continue; }
+      if ((vcount[u.id]||0) > 0) { skip.activated++; continue; }
       const ageH = (now - new Date(u.created_at||now).getTime()) / 3600000;
       const fu = (p.followup && typeof p.followup==='object') ? p.followup : {};
       const doneStage = fu.stage || 0;
-      if (doneStage >= ENZO_SEQUENCE.length) continue;         // finished the sequence
-      const step = ENZO_SEQUENCE[doneStage];                   // next email after doneStage
-      if (!step || ageH < step.minAgeHours) continue;          // not due yet
+      if (doneStage >= ENZO_SEQUENCE.length) { skip.doneSeq++; continue; }
+      const step = ENZO_SEQUENCE[doneStage];
+      if (!step || ageH < step.minAgeHours) { skip.notDue++; fuPush({ phase:'not_due', to:email, ageHours:Math.round(ageH*10)/10, needsHours: step?step.minAgeHours:null }); continue; }
       due++;
       const nm = (u.user_metadata && u.user_metadata.name) ? String(u.user_metadata.name).trim().split(' ')[0] : 'there';
       const r = await sendEmail(u.email, step.subject(nm), enzoFrame(step.body(nm)));
+      fuPush({ phase:'send', to:email, stage:step.stage, ok:r.ok, id:r.id||null, error:r.error||null });
       if (r.ok) { sent++; try { await sbAdminPatchProfile('id', u.id, { followup: { stage: step.stage, lastSentAt: new Date().toISOString() } }); } catch(e){} }
-      else { console.warn('follow-up send failed for', email, r.error); }
     }
-    return { ran:true, due:due, sent:sent };
-  } catch(e){ return { ran:false, error:e.message }; }
+    fuPush({ phase:'end', due:due, sent:sent, skip:skip });
+    return { ran:true, due:due, sent:sent, skip:skip };
+  } catch(e){ fuPush({ phase:'error', err:e.message }); return { ran:false, error:e.message }; }
 }
 // Auto-run hourly (backend stays warm via keep-alive) + one run ~90s after boot.
 setInterval(function(){ runFollowups().then(function(r){ if(r && r.sent) console.log('Enzo follow-ups sent:', r.sent); }).catch(function(){}); }, 60*60*1000);
 setTimeout(function(){ runFollowups().catch(function(){}); }, 90*1000);
-// Admin: run the engine on demand and see a summary (also lets you verify before trusting the automation).
+// Admin: run the engine on demand (member/admin).
 app.get('/api/admin/run-followups', requireMember, async (req, res) => {
   if (!req.memberEmail || req.memberEmail !== ADMIN_EMAIL) return res.status(403).json({ error:'forbidden' });
   res.json(await runFollowups());
+});
+// Admin diagnostic (key-guarded so it can be checked directly): ?run=1 triggers a run, then shows the log.
+app.get('/api/admin/followup-debug', async (req, res) => {
+  if (!isAdmin(req)) return res.status(403).json({ error:'forbidden' });
+  let ran = null;
+  if (req.query.run === '1') ran = await runFollowups();
+  res.json({ hasResendKey: !!RESEND_API_KEY, replyTo: (process.env.REPLY_TO_EMAIL || ADMIN_EMAIL), ran: ran, log: followupDebug.slice(-30) });
 });
 
 // ── CINEMATIC PRO (AIMLAPI: Seedance 1.5 Pro free tier @1080p, Google Veo 3.1 Lite paid @720p) ──
