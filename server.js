@@ -358,7 +358,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.98.1',
+    version: '8.98.3',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -830,9 +830,15 @@ async function runFollowups(){
     try { const lr = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/library?select=user_id,kind', { headers:{ apikey:SUPABASE_SERVICE_ROLE, Authorization:'Bearer '+SUPABASE_SERVICE_ROLE } }); const libs = lr.ok ? await lr.json() : []; (Array.isArray(libs)?libs:[]).forEach(function(r2){ if(r2.kind!=='photo') vcount[r2.user_id]=(vcount[r2.user_id]||0)+1; }); } catch(e){}
     fuPush({ phase:'data', profilesHttp: profHttp, profilesLoaded: Object.keys(pmap).length });
     const now = Date.now();
+    // Ali's own gmail bases (dots + "+tag" ignored, the way Gmail treats them) — never email his own/test accounts,
+    // EXCEPT one kept "sample" address that DOES receive Enzo's emails so Ali can watch the flow in his own inbox.
+    const OWNER_BASES = ['enerstudioio', 'enersolutionca'];
+    const TEST_SAMPLE = (process.env.TEST_SAMPLE_EMAIL || 'enersolution.ca+wiz1@gmail.com').toLowerCase();
     for (const u of users) {
       const email = (u.email||'').toLowerCase();
-      if (!email || email === ADMIN_EMAIL || email.indexOf('@enerstudio.io') >= 0) { skip.admin++; continue; }
+      const localBase = email.split('@')[0].split('+')[0].replace(/\./g,'');
+      const isSample = (email === TEST_SAMPLE);
+      if (!isSample && (!email || email === ADMIN_EMAIL || email.indexOf('@enerstudio.io') >= 0 || OWNER_BASES.indexOf(localBase) >= 0)) { skip.admin++; continue; }
       const p = pmap[u.id];
       if (!p) { skip.noProfile++; continue; }
       if (PAID_STATUSES.includes(p.sub_status)) { skip.paid++; continue; }
