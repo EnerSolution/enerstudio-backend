@@ -358,7 +358,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.98.3',
+    version: '8.99.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -812,13 +812,26 @@ const ENZO_SEQUENCE = [
   { stage:5, minAgeHours:192, subject:function(n){ return 'Can I help you make your first video, '+n+'?'; },
     body:function(n){ return '<p>Hi '+n+',</p><p>I noticed you haven’t made your first video yet — totally okay! If something got in the way, or you have a question, just <b>reply to this email</b> and I’ll personally help you get your first one done.</p><p>It’s free and takes about 2 minutes.</p>'+enzoBtn('Make your first video →')+'<p>— Enzo</p>'; } }
 ];
+// TRIAL/PAID track — for members who have a plan (trialing / active / past_due) but haven't made a video yet.
+// These people have already committed a card, so the goal is to help them get value FAST, not to convince them to try.
+const ENZO_TRIAL_SEQUENCE = [
+  { stage:1, minAgeHours:1, subject:function(n){ return 'You’re in, '+n+'! Let’s make your first video 🎬'; },
+    body:function(n){ return '<p>Hi '+n+',</p><p>I’m <b>Enzo</b> from EnerStudio — welcome aboard, and thank you for choosing us! 🎬</p><p>Your plan is active and ready. The best next step is to make your <b>first video</b>: describe what you want in one sentence, and the AI writes, films, and delivers it in a couple of minutes.</p>'+enzoBtn('Make your first video →')+'<p>Any questions at all, just reply — I’m here to make sure you get real value from day one.</p><p>— Enzo, EnerStudio</p>'; } },
+  { stage:2, minAgeHours:24, subject:function(n){ return 'The quickest first win on your plan (2 minutes)'; },
+    body:function(n){ return '<p>Hi '+n+',</p><p>Want the fastest way to see your plan pay off? Start with a <b>Cinematic ad</b>: type one sentence about your business, hit generate, and you’ll have a polished, professional video in about two minutes.</p><p>Once you’ve made one, the rest feels easy.</p>'+enzoBtn('Create your first video →')+'<p>— Enzo</p>'; } },
+  { stage:3, minAgeHours:72, subject:function(n){ return 'Getting the most out of your EnerStudio plan'; },
+    body:function(n){ return '<p>Hi '+n+',</p><p>Your plan includes cinematic ads, product ads, a talking spokesperson, and more — everything you need to keep a steady stream of videos going without a camera or an editor.</p><p>If you tell me what your business does, I’ll suggest the first three videos that’ll make the biggest difference. Just reply.</p>'+enzoBtn('Open EnerStudio →')+'<p>— Enzo</p>'; } },
+  { stage:4, minAgeHours:120, subject:function(n){ return 'Can I personally help you make your first video, '+n+'?'; },
+    body:function(n){ return '<p>Hi '+n+',</p><p>I noticed you’re set up but haven’t made a video yet — I don’t want your plan going to waste. If anything’s unclear or you’re not sure where to start, just <b>reply to this email</b> and I’ll walk you through your first one, step by step.</p><p>It really does take about 2 minutes once you’re rolling.</p>'+enzoBtn('Make your first video →','#10b981')+'<p>— Enzo</p>'; } }
+];
 // Send the next due Enzo email to leads who haven't activated (0 videos) or subscribed.
 const followupDebug = [];
 function fuPush(e){ try{ followupDebug.push(Object.assign({ t:new Date().toISOString() }, e)); while(followupDebug.length>40) followupDebug.shift(); }catch(_){} }
 async function runFollowups(){
   if (!RESEND_API_KEY || !SUPABASE_SERVICE_ROLE) { fuPush({ phase:'skip_config', hasResend:!!RESEND_API_KEY, hasServiceRole:!!SUPABASE_SERVICE_ROLE }); return { ran:false, reason:'not configured (need RESEND_API_KEY)' }; }
   let sent = 0, due = 0;
-  const skip = { admin:0, noProfile:0, paid:0, activated:0, doneSeq:0, notDue:0 };
+  const skip = { admin:0, noProfile:0, activated:0, doneSeq:0, notDue:0, ratelimited:0 };
+  const MIN_GAP_MS = 20 * 3600000; // never send a lead more than one email per ~day
   try {
     const ur = await fetch(SUPABASE_URL_ADMIN + '/auth/v1/admin/users?per_page=200', { headers:{ apikey:SUPABASE_SERVICE_ROLE, Authorization:'Bearer '+SUPABASE_SERVICE_ROLE } });
     const ud = await ur.json().catch(function(){ return {}; });
@@ -841,19 +854,32 @@ async function runFollowups(){
       if (!isSample && (!email || email === ADMIN_EMAIL || email.indexOf('@enerstudio.io') >= 0 || OWNER_BASES.indexOf(localBase) >= 0)) { skip.admin++; continue; }
       const p = pmap[u.id];
       if (!p) { skip.noProfile++; continue; }
-      if (PAID_STATUSES.includes(p.sub_status)) { skip.paid++; continue; }
+      // Anyone who has made a video is activated — no nurture on either track.
       if ((vcount[u.id]||0) > 0) { skip.activated++; continue; }
       const ageH = (now - new Date(u.created_at||now).getTime()) / 3600000;
       const fu = (p.followup && typeof p.followup==='object') ? p.followup : {};
-      const doneStage = fu.stage || 0;
-      if (doneStage >= ENZO_SEQUENCE.length) { skip.doneSeq++; continue; }
-      const step = ENZO_SEQUENCE[doneStage];
-      if (!step || ageH < step.minAgeHours) { skip.notDue++; fuPush({ phase:'not_due', to:email, ageHours:Math.round(ageH*10)/10, needsHours: step?step.minAgeHours:null }); continue; }
+      // Choose the track: trial/paid members (card on file, 0 videos) get the TRIAL sequence;
+      // free/unknown members get the standard welcome sequence. Each track has its own stage + timestamp keys.
+      const isPaid = PAID_STATUSES.includes(p.sub_status);
+      const seq      = isPaid ? ENZO_TRIAL_SEQUENCE : ENZO_SEQUENCE;
+      const stageKey = isPaid ? 'tstage'      : 'stage';
+      const sentKey  = isPaid ? 'tLastSentAt' : 'lastSentAt';
+      const track    = isPaid ? 'trial'       : 'welcome';
+      const doneStage = fu[stageKey] || 0;
+      if (doneStage >= seq.length) { skip.doneSeq++; continue; }
+      const step = seq[doneStage];
+      if (!step || ageH < step.minAgeHours) { skip.notDue++; fuPush({ phase:'not_due', track:track, to:email, ageHours:Math.round(ageH*10)/10, needsHours: step?step.minAgeHours:null }); continue; }
+      // Max one email per ~day, measured across BOTH tracks so a lead never gets a burst.
+      const lastAny = Math.max(
+        fu.lastSentAt  ? new Date(fu.lastSentAt).getTime()  : 0,
+        fu.tLastSentAt ? new Date(fu.tLastSentAt).getTime() : 0
+      );
+      if (lastAny && (now - lastAny) < MIN_GAP_MS) { skip.ratelimited++; fuPush({ phase:'rate_limited', to:email, hoursSinceLast:Math.round((now-lastAny)/360000)/10 }); continue; }
       due++;
       const nm = (u.user_metadata && u.user_metadata.name) ? String(u.user_metadata.name).trim().split(' ')[0] : 'there';
       const r = await sendEmail(u.email, step.subject(nm), enzoFrame(step.body(nm)));
-      fuPush({ phase:'send', to:email, stage:step.stage, ok:r.ok, id:r.id||null, error:r.error||null });
-      if (r.ok) { sent++; try { await sbAdminPatchProfile('id', u.id, { followup: { stage: step.stage, lastSentAt: new Date().toISOString() } }); } catch(e){} }
+      fuPush({ phase:'send', track:track, to:email, stage:step.stage, ok:r.ok, id:r.id||null, error:r.error||null });
+      if (r.ok) { sent++; const newFu = Object.assign({}, fu); newFu[stageKey] = step.stage; newFu[sentKey] = new Date().toISOString(); try { await sbAdminPatchProfile('id', u.id, { followup: newFu }); } catch(e){} }
     }
     fuPush({ phase:'end', due:due, sent:sent, skip:skip });
     return { ran:true, due:due, sent:sent, skip:skip };
