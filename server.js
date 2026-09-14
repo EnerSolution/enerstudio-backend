@@ -68,6 +68,17 @@ async function sbAdminGetProfileField(uid, field) {
     return (Array.isArray(rows) && rows[0]) ? (rows[0][field] || null) : null;
   } catch (e) { return null; }
 }
+// Read one profile row by any filter field (e.g. by stripe_customer inside the webhook).
+async function sbAdminGetProfileBy(filterField, filterValue, select) {
+  if (!SUPABASE_SERVICE_ROLE || !filterValue) return null;
+  try {
+    const r = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles?' + filterField + '=eq.' + encodeURIComponent(filterValue) + '&select=' + (select || '*'), {
+      headers: { apikey: SUPABASE_SERVICE_ROLE, Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE }
+    });
+    const rows = await r.json();
+    return (Array.isArray(rows) && rows[0]) ? rows[0] : null;
+  } catch (e) { return null; }
+}
 
 // ── PLAN LIMITS (server-side, authoritative) ──
 // Per-type monthly allowances. avatarMin is counted in MINUTES; everything else in videos.
@@ -89,7 +100,7 @@ async function checkAndConsume(memberId, type, amount) {
   if (!SUPABASE_SERVICE_ROLE || !memberId) return { ok: true }; // not configured → don't block
   let p;
   try {
-    const r = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles?id=eq.' + encodeURIComponent(memberId) + '&select=plan,sub_status,usage', {
+    const r = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles?id=eq.' + encodeURIComponent(memberId) + '&select=plan,sub_status,usage,locked', {
       headers: { apikey: SUPABASE_SERVICE_ROLE, Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE }
     });
     if (!r.ok) return { ok: true }; // infra error → fail open
@@ -97,6 +108,9 @@ async function checkAndConsume(memberId, type, amount) {
     p = (Array.isArray(rows) && rows[0]) ? rows[0] : null;
   } catch (e) { return { ok: true }; } // network error → fail open
   if (!p) return { ok: true };
+  if (p.locked === true) {
+    return { ok: false, code: 402, locked: true, error: 'Your trial has ended. Subscribe to reactivate your account and keep creating.' };
+  }
   if (!PAID_STATUSES.includes(p.sub_status)) {
     return { ok: false, code: 402, error: 'This feature requires an active plan. Please upgrade to keep creating.' };
   }
@@ -164,11 +178,13 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
       console.log('✅ Checkout completed:', obj.customer_email || obj.customer, '| sub:', obj.subscription);
       const uid = obj.client_reference_id;
       if (uid) {
-        const patch = { stripe_customer: obj.customer || null, stripe_subscription: obj.subscription || null, sub_status: 'trialing' };
+        // Starting a subscription checkout consumes this account's one free trial. trial_used stays true forever.
+        const patch = { stripe_customer: obj.customer || null, stripe_subscription: obj.subscription || null, sub_status: 'trialing', trial_used: true, locked: false };
         try {
           if (obj.subscription) {
             const sub = await stripe.subscriptions.retrieve(obj.subscription);
             patch.sub_status = sub.status;
+            if (sub.status === 'active') { patch.paid_ever = true; } // subscribed with no trial → already paying
             const priceId = (sub.items && sub.items.data && sub.items.data[0] && sub.items.data[0].price) ? sub.items.data[0].price.id : null;
             const pc = planFromPriceId(priceId);
             if (pc.plan) { patch.plan = pc.plan; patch.sub_cycle = pc.cycle; }
@@ -184,16 +200,30 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
       const pc = planFromPriceId(priceId);
       if (pc.plan) { patch.plan = pc.plan; patch.sub_cycle = pc.cycle; }
       if (obj.current_period_end) patch.current_period_end = new Date(obj.current_period_end * 1000).toISOString();
+      if (obj.status === 'trialing') { patch.trial_used = true; }
+      if (obj.status === 'active') { patch.paid_ever = true; patch.locked = false; } // a real payment cleared → unlock, mark paid
+      // Trial/subscription ended in a non-paying state → LOCK the account, unless they had already paid before (renewal dunning).
+      if (['past_due', 'unpaid', 'incomplete_expired', 'canceled'].indexOf(obj.status) !== -1) {
+        const prof = await sbAdminGetProfileBy('stripe_customer', obj.customer, 'paid_ever');
+        if (!prof || prof.paid_ever !== true) { patch.locked = true; }
+      }
       await sbAdminPatchProfile('stripe_customer', obj.customer, patch);
     } else if (event.type === 'invoice.paid') {
       console.log('💰 Invoice paid:', obj.customer_email || obj.customer);
-      await sbAdminPatchProfile('stripe_customer', obj.customer, { sub_status: 'active' });
+      await sbAdminPatchProfile('stripe_customer', obj.customer, { sub_status: 'active', paid_ever: true, locked: false });
     } else if (event.type === 'invoice.payment_failed') {
+      // This is the key trial-end signal: the card was declined when Stripe tried the first real charge.
       console.warn('⚠️ Invoice payment FAILED:', obj.customer_email || obj.customer);
-      await sbAdminPatchProfile('stripe_customer', obj.customer, { sub_status: 'past_due' });
+      const prof = await sbAdminGetProfileBy('stripe_customer', obj.customer, 'paid_ever');
+      const patch = { sub_status: 'past_due' };
+      if (!prof || prof.paid_ever !== true) { patch.locked = true; } // never paid → trial-abuse / declined card → lock
+      await sbAdminPatchProfile('stripe_customer', obj.customer, patch);
     } else if (event.type === 'customer.subscription.deleted') {
       console.log('Subscription cancelled:', obj.id);
-      await sbAdminPatchProfile('stripe_customer', obj.customer, { sub_status: 'canceled' });
+      const prof = await sbAdminGetProfileBy('stripe_customer', obj.customer, 'paid_ever');
+      const patch = { sub_status: 'canceled' };
+      if (!prof || prof.paid_ever !== true) { patch.locked = true; } // canceled while never having paid → lock
+      await sbAdminPatchProfile('stripe_customer', obj.customer, patch);
     }
   } catch (e) { console.warn('webhook handler error', e.message); }
   res.json({ received: true });
@@ -358,7 +388,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '8.99.0',
+    version: '9.0.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -660,11 +690,16 @@ app.post('/api/stripe/create-checkout', async (req, res) => {
     const priceId = STRIPE_PRICES[key];
     if (!priceId) return res.status(400).json({ error: 'Unknown plan/cycle: ' + key });
     const origin = (req.headers.origin) || 'https://app.enerstudio.io';
+    // One free trial per account, ever. If this account already used its trial (or a fraud/decline locked it),
+    // they subscribe and pay immediately — no second free trial on the same email.
+    let trialUsed = false;
+    if (uid) { try { trialUsed = (await sbAdminGetProfileField(uid, 'trial_used')) === true; } catch (e) {} }
+    const subData = trialUsed ? {} : { trial_period_days: TRIAL_DAYS };
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       payment_method_types: ['card'],
       line_items: [{ price: priceId, quantity: 1 }],
-      subscription_data: { trial_period_days: TRIAL_DAYS },
+      subscription_data: subData,
       customer_email: email || undefined,
       client_reference_id: uid || undefined,
       allow_promotion_codes: true,
@@ -714,12 +749,13 @@ app.post('/api/stripe/portal', async (req, res) => {
 app.get('/api/usage', requireMember, async (req, res) => {
   try {
     if (!SUPABASE_SERVICE_ROLE) return res.json({ plan: null, paid: false, caps: {}, usage: {}, remaining: {} });
-    const r = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles?id=eq.' + encodeURIComponent(req.memberId) + '&select=plan,sub_status,usage', {
+    const r = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles?id=eq.' + encodeURIComponent(req.memberId) + '&select=plan,sub_status,usage,locked', {
       headers: { apikey: SUPABASE_SERVICE_ROLE, Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE }
     });
     const rows = r.ok ? await r.json() : [];
     const p = (Array.isArray(rows) && rows[0]) ? rows[0] : {};
-    const paid = PAID_STATUSES.includes(p.sub_status);
+    const locked = (p.locked === true);
+    const paid = !locked && PAID_STATUSES.includes(p.sub_status);
     const plan = (p.plan && PLAN_CAPS[p.plan]) ? p.plan : (paid ? 'starter' : null);
     const caps = plan ? PLAN_CAPS[plan] : {};
     const mk = monthKey();
@@ -727,8 +763,8 @@ app.get('/api/usage', requireMember, async (req, res) => {
     if (usage.__month !== mk) usage = { __month: mk };
     const remaining = {};
     for (const k in caps) remaining[k] = Math.max(0, caps[k] - (usage[k] || 0));
-    res.json({ plan: plan, paid: paid, month: mk, caps: caps, usage: usage, remaining: remaining });
-  } catch (e) { res.json({ plan: null, paid: false, caps: {}, usage: {}, remaining: {} }); }
+    res.json({ plan: plan, paid: paid, locked: locked, month: mk, caps: caps, usage: usage, remaining: remaining });
+  } catch (e) { res.json({ plan: null, paid: false, locked: false, caps: {}, usage: {}, remaining: {} }); }
 });
 
 // ── ADMIN CONSOLE — LEADS (admin account only) ──
@@ -824,6 +860,15 @@ const ENZO_TRIAL_SEQUENCE = [
   { stage:4, minAgeHours:120, subject:function(n){ return 'Can I personally help you make your first video, '+n+'?'; },
     body:function(n){ return '<p>Hi '+n+',</p><p>I noticed you’re set up but haven’t made a video yet — I don’t want your plan going to waste. If anything’s unclear or you’re not sure where to start, just <b>reply to this email</b> and I’ll walk you through your first one, step by step.</p><p>It really does take about 2 minutes once you’re rolling.</p>'+enzoBtn('Make your first video →','#10b981')+'<p>— Enzo</p>'; } }
 ];
+// WIN-BACK track — for accounts whose trial ended WITHOUT a successful payment (locked). Warm, no blame, come back and subscribe.
+const ENZO_WINBACK_SEQUENCE = [
+  { stage:1, minAgeHours:1, subject:function(n){ return 'Your EnerStudio trial has ended — pick up where you left off'; },
+    body:function(n){ return '<p>Hi '+n+',</p><p>I’m <b>Enzo</b> from EnerStudio. Your free trial just wrapped up, so your account is paused for now — but everything’s still here waiting for you.</p><p>Ready to keep making videos? Choose a plan and you’re back in instantly.</p>'+enzoBtn('Reactivate my account →','#10b981')+'<p>Questions before you decide? Just reply — I’m happy to help.</p><p>— Enzo, EnerStudio</p>'; } },
+  { stage:2, minAgeHours:72, subject:function(n){ return 'Still want those videos, '+n+'?'; },
+    body:function(n){ return '<p>Hi '+n+',</p><p>No pressure at all — I just didn’t want you to miss out. Businesses use EnerStudio to turn <b>one sentence</b> into polished videos, with no camera and no editor, for a fraction of an agency’s cost.</p><p>Whenever you’re ready, your account picks right back up.</p>'+enzoBtn('See the plans →')+'<p>— Enzo</p>'; } },
+  { stage:3, minAgeHours:168, subject:function(n){ return 'One last note from me 🎬'; },
+    body:function(n){ return '<p>Hi '+n+',</p><p>I won’t keep emailing — I know inboxes are busy. If EnerStudio isn’t the right fit right now, no worries at all.</p><p>But if you ever want to make a video, I’m one click away, and I’d love to help you get your first one done.</p>'+enzoBtn('Come back anytime →')+'<p>— Enzo, EnerStudio</p>'; } }
+];
 // Send the next due Enzo email to leads who haven't activated (0 videos) or subscribed.
 const followupDebug = [];
 function fuPush(e){ try{ followupDebug.push(Object.assign({ t:new Date().toISOString() }, e)); while(followupDebug.length>40) followupDebug.shift(); }catch(_){} }
@@ -838,7 +883,7 @@ async function runFollowups(){
     const users = (ud && Array.isArray(ud.users)) ? ud.users : (Array.isArray(ud) ? ud : []);
     fuPush({ phase:'users', http: ur.status, count: users.length, rawKeys: (ud && typeof ud==='object' && !Array.isArray(ud)) ? Object.keys(ud).slice(0,8) : 'array' });
     let pmap = {}; let profHttp = 0;
-    try { const pr = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles?select=id,sub_status,followup', { headers:{ apikey:SUPABASE_SERVICE_ROLE, Authorization:'Bearer '+SUPABASE_SERVICE_ROLE } }); profHttp = pr.status; const profs = pr.ok ? await pr.json() : []; (Array.isArray(profs)?profs:[]).forEach(function(p){ pmap[p.id]=p; }); } catch(e){}
+    try { const pr = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles?select=id,sub_status,followup,locked', { headers:{ apikey:SUPABASE_SERVICE_ROLE, Authorization:'Bearer '+SUPABASE_SERVICE_ROLE } }); profHttp = pr.status; const profs = pr.ok ? await pr.json() : []; (Array.isArray(profs)?profs:[]).forEach(function(p){ pmap[p.id]=p; }); } catch(e){}
     let vcount = {};
     try { const lr = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/library?select=user_id,kind', { headers:{ apikey:SUPABASE_SERVICE_ROLE, Authorization:'Bearer '+SUPABASE_SERVICE_ROLE } }); const libs = lr.ok ? await lr.json() : []; (Array.isArray(libs)?libs:[]).forEach(function(r2){ if(r2.kind!=='photo') vcount[r2.user_id]=(vcount[r2.user_id]||0)+1; }); } catch(e){}
     fuPush({ phase:'data', profilesHttp: profHttp, profilesLoaded: Object.keys(pmap).length });
@@ -854,17 +899,22 @@ async function runFollowups(){
       if (!isSample && (!email || email === ADMIN_EMAIL || email.indexOf('@enerstudio.io') >= 0 || OWNER_BASES.indexOf(localBase) >= 0)) { skip.admin++; continue; }
       const p = pmap[u.id];
       if (!p) { skip.noProfile++; continue; }
-      // Anyone who has made a video is activated — no nurture on either track.
-      if ((vcount[u.id]||0) > 0) { skip.activated++; continue; }
+      const isLocked = (p.locked === true);
+      // Locked accounts (trial ended, never paid) get the WIN-BACK track — even if they made videos during the trial.
+      // Everyone else who has made a video is activated — no nurture.
+      if (!isLocked && (vcount[u.id]||0) > 0) { skip.activated++; continue; }
       const ageH = (now - new Date(u.created_at||now).getTime()) / 3600000;
       const fu = (p.followup && typeof p.followup==='object') ? p.followup : {};
-      // Choose the track: trial/paid members (card on file, 0 videos) get the TRIAL sequence;
-      // free/unknown members get the standard welcome sequence. Each track has its own stage + timestamp keys.
-      const isPaid = PAID_STATUSES.includes(p.sub_status);
-      const seq      = isPaid ? ENZO_TRIAL_SEQUENCE : ENZO_SEQUENCE;
-      const stageKey = isPaid ? 'tstage'      : 'stage';
-      const sentKey  = isPaid ? 'tLastSentAt' : 'lastSentAt';
-      const track    = isPaid ? 'trial'       : 'welcome';
+      // Choose the track:
+      //  • LOCKED (trial ended, not paid) → win-back sequence.
+      //  • trial/paid members with a card on file + 0 videos → trial-activation sequence.
+      //  • free / unknown members → standard welcome sequence.
+      // Each track has its own stage + timestamp keys inside the same profiles.followup jsonb.
+      const isPaid = !isLocked && PAID_STATUSES.includes(p.sub_status);
+      const seq      = isLocked ? ENZO_WINBACK_SEQUENCE : (isPaid ? ENZO_TRIAL_SEQUENCE : ENZO_SEQUENCE);
+      const stageKey = isLocked ? 'wstage'      : (isPaid ? 'tstage'      : 'stage');
+      const sentKey  = isLocked ? 'wLastSentAt' : (isPaid ? 'tLastSentAt' : 'lastSentAt');
+      const track    = isLocked ? 'winback'     : (isPaid ? 'trial'       : 'welcome');
       const doneStage = fu[stageKey] || 0;
       if (doneStage >= seq.length) { skip.doneSeq++; continue; }
       const step = seq[doneStage];
@@ -872,7 +922,8 @@ async function runFollowups(){
       // Max one email per ~day, measured across BOTH tracks so a lead never gets a burst.
       const lastAny = Math.max(
         fu.lastSentAt  ? new Date(fu.lastSentAt).getTime()  : 0,
-        fu.tLastSentAt ? new Date(fu.tLastSentAt).getTime() : 0
+        fu.tLastSentAt ? new Date(fu.tLastSentAt).getTime() : 0,
+        fu.wLastSentAt ? new Date(fu.wLastSentAt).getTime() : 0
       );
       if (lastAny && (now - lastAny) < MIN_GAP_MS) { skip.ratelimited++; fuPush({ phase:'rate_limited', to:email, hoursSinceLast:Math.round((now-lastAny)/360000)/10 }); continue; }
       due++;
