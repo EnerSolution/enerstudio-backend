@@ -32,7 +32,7 @@ const STRIPE_PRICES = {
   pro_monthly:      'price_1TvjDrCgPveo3ZNuyTLdUECF',
   pro_annual:       'price_1TvjDrCgPveo3ZNuEY2NKG3T',
   business_monthly: 'price_1TvjDrCgPveo3ZNuD5fmmO6N',
-  business_annual:  'price_1TvjDrCgPveo3ZNutGJ1RT16'
+  business_annual:  'price_1UFdI6CgPveo3ZNuXGfhBitk'
 };
 const STRIPE_PUBLISHABLE = process.env.STRIPE_PUBLISHABLE_KEY || 'pk_live_51To5hMCgPveo3ZNuVu0rxaCNlX7vD2LxbRXo6Ra0emPO0KC6af09osJVr8S4cVIiCiDqlPDRZjrjKV3cdfLlrD9U00yu279ugH';
 const TRIAL_DAYS = 7;
@@ -388,7 +388,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.0.0',
+    version: '9.0.1',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
