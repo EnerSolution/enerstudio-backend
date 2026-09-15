@@ -388,7 +388,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.0.1',
+    version: '9.1.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -2540,8 +2540,9 @@ app.post('/api/slides/animate', rateLimit(30), requireMember, async (req, res) =
       }
     }
 
-    // ══ PRODUCT ADS BRANCH: animate uploaded product image(s) behind ad captions ══
-    if (videoType === 'productad' && Array.isArray(productImages) && productImages.length) {
+    // ══ PRODUCT ADS / SLIDESHOW BRANCH: Ken-Burns the uploaded photo(s) behind captions ══
+    // Slideshow reuses this exact proven engine: one uploaded photo per scene, in order, with music.
+    if ((videoType === 'productad' || videoType === 'slideshow') && Array.isArray(productImages) && productImages.length) {
       try {
         const nScenes = slides.length;
         const secsArr = (perSlideSecs && perSlideSecs.length === nScenes)
