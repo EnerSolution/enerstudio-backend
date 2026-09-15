@@ -388,7 +388,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.1.2',
+    version: '9.1.3',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -2656,12 +2656,15 @@ print('overlays',len(SLIDES))
           // pick an image: cycle through uploaded images per scene
           const src = imgPaths[i % imgPaths.length];
           const frames = Math.round(secs * 30);
-          // Slideshow supersamples each photo (2×) BEFORE the zoom so zoompan's per-frame
-          // integer x/y rounding is invisible — this removes the "shaking"/jitter without the
-          // memory blow-up a 3× frame caused. Product ads keep the original path (SS=1) unchanged.
-          const SS = (videoType === 'slideshow') ? 2 : 1;
+          // Slideshow supersamples each photo (3×) BEFORE the zoom so zoompan's per-frame
+          // integer x/y rounding is far too small to see — this removes the "shaking"/jitter.
+          // The render completes fine at 3×; we just keep the OUTPUT small (higher crf below)
+          // so it always returns inline to the app. Product ads keep the original path (SS=1).
+          const isShow = (videoType === 'slideshow');
+          const SS = isShow ? 3 : 1;
           const bW = W * SS, bH = H * SS;
-          const zTop = (videoType === 'slideshow') ? '1.22' : '1.18';
+          const zTop = isShow ? '1.22' : '1.18';
+          const sceneCrf = isShow ? 28 : 23; // higher crf → smaller file → inline delivery (no /api/video fetch)
           // alternate zoom-in / zoom-out for variety
           const zoomExpr = (i % 2 === 0) ? ("min(zoom+0.0015," + zTop + ")") : ("if(lte(zoom,1.0)," + zTop + ",max(zoom-0.0015,1.0))");
           // pad the photo onto a branded background, then ken-burns
@@ -2670,7 +2673,7 @@ print('overlays',len(SLIDES))
                    + "pad=" + bW + ":" + bH + ":(ow-iw)/2:(oh-ih)/2:color=" + bgc + ","
                    + "zoompan=z='" + zoomExpr + "':d=" + frames + ":s=" + W + "x" + H + ":fps=30:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',"
                    + "setsar=1,format=yuv420p";
-          execSync('"' + ffmpegPath + '" -y -loop 1 -t ' + secs.toFixed(2) + ' -i "' + src + '" -i "' + ovPng + '" -filter_complex "[0:v]' + vf + '[bg];[bg][1:v]overlay=0:0:format=auto,format=yuv420p[out]" -map "[out]" -t ' + secs.toFixed(2) + ' -r 30 -vsync cfr -an -c:v libx264 -preset ultrafast -threads 1 -x264-params "rc-lookahead=10:sync-lookahead=0:bframes=0:ref=1:sliced-threads=0" -crf 23 -pix_fmt yuv420p "' + outClip + '"', { timeout: 180000 });
+          execSync('"' + ffmpegPath + '" -y -loop 1 -t ' + secs.toFixed(2) + ' -i "' + src + '" -i "' + ovPng + '" -filter_complex "[0:v]' + vf + '[bg];[bg][1:v]overlay=0:0:format=auto,format=yuv420p[out]" -map "[out]" -t ' + secs.toFixed(2) + ' -r 30 -vsync cfr -an -c:v libx264 -preset ultrafast -threads 1 -x264-params "rc-lookahead=10:sync-lookahead=0:bframes=0:ref=1:sliced-threads=0" -crf ' + sceneCrf + ' -pix_fmt yuv420p "' + outClip + '"', { timeout: 180000 });
           sceneClips.push(outClip);
         }
 
@@ -2678,7 +2681,8 @@ print('overlays',len(SLIDES))
         const listF = path.join(tempDir, 'prod_concat.txt');
         fs.writeFileSync(listF, sceneClips.map(f => "file '" + f + "'").join('\n'));
         const stitchedV = path.join(tempDir, 'prod_stitched.mp4');
-        execSync('"' + ffmpegPath + '" -y -f concat -safe 0 -i "' + listF + '" -c:v libx264 -preset ultrafast -threads 1 -x264-params "rc-lookahead=10:sync-lookahead=0:bframes=0:ref=1:sliced-threads=0" -crf 24 -r 30 -pix_fmt yuv420p "' + stitchedV + '"', { timeout: 240000 });
+        const concatCrf = isShow ? 28 : 24; // keep slideshow output small enough to return inline
+        execSync('"' + ffmpegPath + '" -y -f concat -safe 0 -i "' + listF + '" -c:v libx264 -preset ultrafast -threads 1 -x264-params "rc-lookahead=10:sync-lookahead=0:bframes=0:ref=1:sliced-threads=0" -crf ' + concatCrf + ' -r 30 -pix_fmt yuv420p "' + stitchedV + '"', { timeout: 240000 });
 
         // 5) audio
         let finalV = stitchedV, muxAudioPath = null;
@@ -2699,7 +2703,8 @@ print('overlays',len(SLIDES))
         const sz = fs.statSync(finalPath).size;
         outputStore[vid] = { path: finalPath, size: sz, created: Date.now() };
         let videoData = null;
-        if (sz < 20 * 1024 * 1024) videoData = 'data:video/mp4;base64,' + fs.readFileSync(finalPath).toString('base64');
+        const inlineCap = (videoType === 'slideshow') ? (30 * 1024 * 1024) : (20 * 1024 * 1024);
+        if (sz < inlineCap) videoData = 'data:video/mp4;base64,' + fs.readFileSync(finalPath).toString('base64');
         try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(e) {}
         console.log('Product Ad video ready', vid, Math.round(sz/1024) + 'KB', imgPaths.length + ' images');
         return res.json({ videoId: vid, size: sz, videoData: videoData, productad: true });
