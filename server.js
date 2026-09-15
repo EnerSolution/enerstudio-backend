@@ -388,7 +388,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.1.1',
+    version: '9.1.2',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -2656,12 +2656,12 @@ print('overlays',len(SLIDES))
           // pick an image: cycle through uploaded images per scene
           const src = imgPaths[i % imgPaths.length];
           const frames = Math.round(secs * 30);
-          // Slideshow supersamples each photo (3×) BEFORE the zoom so zoompan's per-frame
-          // integer x/y rounding is invisible — this removes the "shaking"/jitter. It also
-          // uses a slightly deeper zoom. Product ads keep the original path (SS=1) unchanged.
-          const SS = (videoType === 'slideshow') ? 3 : 1;
+          // Slideshow supersamples each photo (2×) BEFORE the zoom so zoompan's per-frame
+          // integer x/y rounding is invisible — this removes the "shaking"/jitter without the
+          // memory blow-up a 3× frame caused. Product ads keep the original path (SS=1) unchanged.
+          const SS = (videoType === 'slideshow') ? 2 : 1;
           const bW = W * SS, bH = H * SS;
-          const zTop = (videoType === 'slideshow') ? '1.26' : '1.18';
+          const zTop = (videoType === 'slideshow') ? '1.22' : '1.18';
           // alternate zoom-in / zoom-out for variety
           const zoomExpr = (i % 2 === 0) ? ("min(zoom+0.0015," + zTop + ")") : ("if(lte(zoom,1.0)," + zTop + ",max(zoom-0.0015,1.0))");
           // pad the photo onto a branded background, then ken-burns
