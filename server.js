@@ -388,7 +388,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.1.0',
+    version: '9.1.1',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -2656,12 +2656,18 @@ print('overlays',len(SLIDES))
           // pick an image: cycle through uploaded images per scene
           const src = imgPaths[i % imgPaths.length];
           const frames = Math.round(secs * 30);
+          // Slideshow supersamples each photo (3×) BEFORE the zoom so zoompan's per-frame
+          // integer x/y rounding is invisible — this removes the "shaking"/jitter. It also
+          // uses a slightly deeper zoom. Product ads keep the original path (SS=1) unchanged.
+          const SS = (videoType === 'slideshow') ? 3 : 1;
+          const bW = W * SS, bH = H * SS;
+          const zTop = (videoType === 'slideshow') ? '1.26' : '1.18';
           // alternate zoom-in / zoom-out for variety
-          const zoomExpr = (i % 2 === 0) ? "min(zoom+0.0015,1.18)" : "if(lte(zoom,1.0),1.18,max(zoom-0.0015,1.0))";
-          // pad the product image onto a branded background, then ken-burns
+          const zoomExpr = (i % 2 === 0) ? ("min(zoom+0.0015," + zTop + ")") : ("if(lte(zoom,1.0)," + zTop + ",max(zoom-0.0015,1.0))");
+          // pad the photo onto a branded background, then ken-burns
           const bgc = (PAL.bg_dark || '#0B1F3A').replace('#','0x');
-          const vf = "scale=" + W + ":" + H + ":force_original_aspect_ratio=decrease,"
-                   + "pad=" + W + ":" + H + ":(ow-iw)/2:(oh-ih)/2:color=" + bgc + ","
+          const vf = "scale=" + bW + ":" + bH + ":force_original_aspect_ratio=decrease,"
+                   + "pad=" + bW + ":" + bH + ":(ow-iw)/2:(oh-ih)/2:color=" + bgc + ","
                    + "zoompan=z='" + zoomExpr + "':d=" + frames + ":s=" + W + "x" + H + ":fps=30:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',"
                    + "setsar=1,format=yuv420p";
           execSync('"' + ffmpegPath + '" -y -loop 1 -t ' + secs.toFixed(2) + ' -i "' + src + '" -i "' + ovPng + '" -filter_complex "[0:v]' + vf + '[bg];[bg][1:v]overlay=0:0:format=auto,format=yuv420p[out]" -map "[out]" -t ' + secs.toFixed(2) + ' -r 30 -vsync cfr -an -c:v libx264 -preset ultrafast -threads 1 -x264-params "rc-lookahead=10:sync-lookahead=0:bframes=0:ref=1:sliced-threads=0" -crf 23 -pix_fmt yuv420p "' + outClip + '"', { timeout: 180000 });
