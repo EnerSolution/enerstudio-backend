@@ -388,7 +388,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.1.3',
+    version: '9.1.4',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -2656,23 +2656,30 @@ print('overlays',len(SLIDES))
           // pick an image: cycle through uploaded images per scene
           const src = imgPaths[i % imgPaths.length];
           const frames = Math.round(secs * 30);
-          // Slideshow supersamples each photo (3×) BEFORE the zoom so zoompan's per-frame
-          // integer x/y rounding is far too small to see — this removes the "shaking"/jitter.
-          // The render completes fine at 3×; we just keep the OUTPUT small (higher crf below)
-          // so it always returns inline to the app. Product ads keep the original path (SS=1).
           const isShow = (videoType === 'slideshow');
-          const SS = isShow ? 3 : 1;
-          const bW = W * SS, bH = H * SS;
-          const zTop = isShow ? '1.22' : '1.18';
-          const sceneCrf = isShow ? 28 : 23; // higher crf → smaller file → inline delivery (no /api/video fetch)
-          // alternate zoom-in / zoom-out for variety
-          const zoomExpr = (i % 2 === 0) ? ("min(zoom+0.0015," + zTop + ")") : ("if(lte(zoom,1.0)," + zTop + ",max(zoom-0.0015,1.0))");
-          // pad the photo onto a branded background, then ken-burns
+          const sceneCrf = isShow ? 26 : 23;
           const bgc = (PAL.bg_dark || '#0B1F3A').replace('#','0x');
-          const vf = "scale=" + bW + ":" + bH + ":force_original_aspect_ratio=decrease,"
-                   + "pad=" + bW + ":" + bH + ":(ow-iw)/2:(oh-ih)/2:color=" + bgc + ","
-                   + "zoompan=z='" + zoomExpr + "':d=" + frames + ":s=" + W + "x" + H + ":fps=30:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',"
-                   + "setsar=1,format=yuv420p";
+          let vf;
+          if (isShow) {
+            // SLIDESHOW: smooth Ken Burns by per-frame RESAMPLING (scale, not zoompan).
+            // zoompan integer-crops the raw pixels every frame → visible "shake"; scaling the
+            // whole image a little each frame resamples it → smooth motion. It's also LIGHT
+            // (peaks at ~1.16× the frame, never a huge supersample) so it renders reliably.
+            // Full-bleed cover, then grow/shrink over time and center-crop.
+            const sd = secs.toFixed(2);
+            const grow = (i % 2 === 0) ? ('1+0.16*t/' + sd) : ('1.16-0.16*t/' + sd); // alternate zoom in / out
+            vf = "scale=" + W + ":" + H + ":force_original_aspect_ratio=increase,crop=" + W + ":" + H + ","
+               + "scale=w='iw*(" + grow + ")':h='ih*(" + grow + ")':eval=frame:flags=bicubic,"
+               + "crop=" + W + ":" + H + ":(in_w-" + W + ")/2:(in_h-" + H + ")/2,"
+               + "setsar=1,format=yuv420p";
+          } else {
+            // PRODUCT ADS: original letterboxed zoompan Ken Burns (unchanged).
+            const zoomExpr = (i % 2 === 0) ? "min(zoom+0.0015,1.18)" : "if(lte(zoom,1.0),1.18,max(zoom-0.0015,1.0))";
+            vf = "scale=" + W + ":" + H + ":force_original_aspect_ratio=decrease,"
+               + "pad=" + W + ":" + H + ":(ow-iw)/2:(oh-ih)/2:color=" + bgc + ","
+               + "zoompan=z='" + zoomExpr + "':d=" + frames + ":s=" + W + "x" + H + ":fps=30:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)',"
+               + "setsar=1,format=yuv420p";
+          }
           execSync('"' + ffmpegPath + '" -y -loop 1 -t ' + secs.toFixed(2) + ' -i "' + src + '" -i "' + ovPng + '" -filter_complex "[0:v]' + vf + '[bg];[bg][1:v]overlay=0:0:format=auto,format=yuv420p[out]" -map "[out]" -t ' + secs.toFixed(2) + ' -r 30 -vsync cfr -an -c:v libx264 -preset ultrafast -threads 1 -x264-params "rc-lookahead=10:sync-lookahead=0:bframes=0:ref=1:sliced-threads=0" -crf ' + sceneCrf + ' -pix_fmt yuv420p "' + outClip + '"', { timeout: 180000 });
           sceneClips.push(outClip);
         }
@@ -2709,8 +2716,14 @@ print('overlays',len(SLIDES))
         console.log('Product Ad video ready', vid, Math.round(sz/1024) + 'KB', imgPaths.length + ' images');
         return res.json({ videoId: vid, size: sz, videoData: videoData, productad: true });
       } catch (prodErr) {
-        console.log('Product-ad path failed, falling back to animated:', prodErr.message);
-        // fall through to normal renderer
+        console.log('Photo-montage path failed:', prodErr.message);
+        // For SLIDESHOW, never silently fall through to a photo-less (blue-background) render —
+        // the whole point is the photos. Surface a clear error so the member just retries.
+        if (videoType === 'slideshow') {
+          try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(e) {}
+          return res.status(500).json({ error: 'Slideshow render failed — please try again (fewer or smaller photos if it repeats).' });
+        }
+        // Product ads may fall through to the animated fallback.
       }
     }
 
