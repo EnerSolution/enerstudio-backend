@@ -233,6 +233,9 @@ app.use(express.json({ limit: '50mb' }));
 
 // ── VIDEO OUTPUT STORE (bypasses Render 30s timeout) ──────────────────────
 const outputStore = {}; // { videoId: { path, size, created } }
+// Slideshow diagnostics ring buffer (admin can read the last runs/errors from a browser).
+const showDebug = [];
+function showPush(e){ try { showDebug.push(Object.assign({ t: new Date().toISOString() }, e)); while (showDebug.length > 25) showDebug.shift(); } catch(_){} }
 // Cleanup files older than 30 minutes
 setInterval(() => {
   const cutoff = Date.now() - 24 * 60 * 60 * 1000; // 24 hours
@@ -388,7 +391,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.1.5',
+    version: '9.1.6',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -950,6 +953,11 @@ app.get('/api/admin/followup-debug', async (req, res) => {
   let ran = null;
   if (req.query.run === '1') ran = await runFollowups();
   res.json({ hasResendKey: !!RESEND_API_KEY, replyTo: (process.env.REPLY_TO_EMAIL || ADMIN_EMAIL), ran: ran, log: followupDebug.slice(-30) });
+});
+// Admin: read the last slideshow runs/errors (open in a browser with ?key=ADMIN_KEY).
+app.get('/api/admin/slideshow-debug', (req, res) => {
+  if (!isAdmin(req)) return res.status(403).json({ error: 'forbidden' });
+  res.json({ log: showDebug.slice(-25) });
 });
 
 // ── CINEMATIC PRO (AIMLAPI: Seedance 1.5 Pro free tier @1080p, Google Veo 3.1 Lite paid @720p) ──
@@ -2549,18 +2557,61 @@ app.post('/api/slides/animate', rateLimit(30), requireMember, async (req, res) =
           ? perSlideSecs.slice()
           : new Array(nScenes).fill(durationSecs / nScenes);
 
-        // 1) decode uploaded product images to disk
-        const imgPaths = [];
+        // 1) decode uploaded images to disk (raw bytes, unknown format)
+        const rawList = [];
         productImages.forEach((dataUrl, i) => {
           try {
             const b64 = String(dataUrl).split(',').pop();
             const buf = Buffer.from(b64, 'base64');
             if (buf && buf.length > 500) {
-              const ip = path.join(tempDir, 'prod' + i + '.png');
-              fs.writeFileSync(ip, buf);
-              imgPaths.push(ip);
+              const rp = path.join(tempDir, 'raw' + i);
+              fs.writeFileSync(rp, buf);
+              rawList.push({ i: i, raw: rp });
             }
           } catch (e) { /* skip bad image */ }
+        });
+        if (!rawList.length) throw new Error('no valid images provided');
+        // 1b) NORMALIZE every photo with PIL → clean RGB JPEG, EXIF-rotated, size-capped.
+        // This is what makes uploads reliable: it fixes phone-photo orientation, CMYK/odd
+        // colorspaces, progressive/huge files and most formats the server's ffmpeg can't read,
+        // and shrinks giant photos so the render never runs out of memory.
+        const normPy = path.join(tempDir, 'norm.py');
+        const normJobs = rawList.map(r => [r.raw, path.join(tempDir, 'prod' + r.i + '.jpg')]);
+        fs.writeFileSync(normPy, [
+          'import sys, json',
+          'jobs = json.loads(' + JSON.stringify(JSON.stringify(normJobs)) + ')',
+          'try:',
+          '    from PIL import Image, ImageOps',
+          'except Exception as e:',
+          '    sys.stderr.write("NOPIL:%s\\n" % e); sys.exit(0)',
+          'try:',
+          '    import pillow_heif; pillow_heif.register_heif_opener()',
+          'except Exception: pass',
+          'ok=0',
+          'for src, dst in jobs:',
+          '    try:',
+          '        im = Image.open(src)',
+          '        im = ImageOps.exif_transpose(im)',
+          '        im = im.convert("RGB")',
+          '        im.thumbnail((2200, 2200))',
+          '        im.save(dst, "JPEG", quality=88)',
+          '        ok += 1',
+          '    except Exception as e:',
+          '        sys.stderr.write("normfail %s: %s\\n" % (src, e))',
+          'sys.stderr.write("normalized %d/%d\\n" % (ok, len(jobs)))'
+        ].join('\n'));
+        let normInfo = '';
+        try { normInfo = execSync('python3 "' + normPy + '" 2>&1', { timeout: 120000 }).toString().slice(0, 300); }
+        catch (e) { normInfo = 'normERR:' + (e.message || '').slice(0, 200); }
+        showPush({ phase: 'normalize', info: normInfo, n: rawList.length });
+        // Prefer the normalized JPEG; fall back to the raw file only if normalization skipped it.
+        const imgPaths = [];
+        rawList.forEach(r => {
+          const norm = path.join(tempDir, 'prod' + r.i + '.jpg');
+          try {
+            if (fs.existsSync(norm) && fs.statSync(norm).size > 500) imgPaths.push(norm);
+            else imgPaths.push(r.raw);
+          } catch (e) { imgPaths.push(r.raw); }
         });
         if (!imgPaths.length) throw new Error('no valid product images — using animated fallback');
 
@@ -2703,12 +2754,14 @@ print('overlays',len(SLIDES))
         if (sz < inlineCap) videoData = 'data:video/mp4;base64,' + fs.readFileSync(finalPath).toString('base64');
         try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(e) {}
         console.log('Product Ad video ready', vid, Math.round(sz/1024) + 'KB', imgPaths.length + ' images');
+        if (videoType === 'slideshow') showPush({ phase: 'ok', vid: vid, kb: Math.round(sz/1024), images: imgPaths.length, inline: !!videoData });
         return res.json({ videoId: vid, size: sz, videoData: videoData, productad: true });
       } catch (prodErr) {
         console.log('Photo-montage path failed:', prodErr.message);
         // For SLIDESHOW, never silently fall through to a photo-less (blue-background) render —
         // the whole point is the photos. Surface a clear error so the member just retries.
         if (videoType === 'slideshow') {
+          showPush({ phase: 'error', msg: String(prodErr && prodErr.message || prodErr).slice(0, 400) });
           try { fs.rmSync(tempDir, { recursive: true, force: true }); } catch(e) {}
           return res.status(500).json({ error: 'Slideshow render failed — please try again (fewer or smaller photos if it repeats).', detail: String(prodErr && prodErr.message || prodErr).slice(0, 300) });
         }
