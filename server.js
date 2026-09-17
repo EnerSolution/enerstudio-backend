@@ -391,7 +391,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.1.6',
+    version: '9.1.7',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -2552,6 +2552,7 @@ app.post('/api/slides/animate', rateLimit(30), requireMember, async (req, res) =
     // Slideshow reuses this exact proven engine: one uploaded photo per scene, in order, with music.
     if ((videoType === 'productad' || videoType === 'slideshow') && Array.isArray(productImages) && productImages.length) {
       try {
+        const isShow = (videoType === 'slideshow'); // branch-scope so it's in scope for the concat step too
         const nScenes = slides.length;
         const secsArr = (perSlideSecs && perSlideSecs.length === nScenes)
           ? perSlideSecs.slice()
@@ -2709,7 +2710,6 @@ print('overlays',len(SLIDES))
           const frames = Math.round(secs * 30);
           // Reliable zoom on the server's ffmpeg = zoompan. Slideshow uses a 2× supersample
           // (proven to work; keeps the shake small). Product ads keep SS=1 (unchanged).
-          const isShow = (videoType === 'slideshow');
           const SS = isShow ? 2 : 1;
           const bW = W * SS, bH = H * SS;
           const zTop = isShow ? '1.22' : '1.18';
