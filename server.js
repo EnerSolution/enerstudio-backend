@@ -84,9 +84,9 @@ async function sbAdminGetProfileBy(filterField, filterValue, select) {
 // Per-type monthly allowances. avatarMin is counted in MINUTES; everything else in videos.
 // Cheap engines (faceless/quote/slides) are intentionally generous — they cost ~pennies.
 const PLAN_CAPS = {
-  starter:  { cinematic:4,  productad:10, spokesperson:5,  talkingphoto:5,  avatarMin:2, faceless:20,  quote:40 },
-  pro:      { cinematic:8,  productad:25, spokesperson:10, talkingphoto:10, avatarMin:4, faceless:50,  quote:100 },
-  business: { cinematic:16, productad:50, spokesperson:20, talkingphoto:20, avatarMin:8, faceless:120, quote:250 }
+  starter:  { cinematic:4,  cartoon:2, productad:10, spokesperson:5,  talkingphoto:5,  avatarMin:2, faceless:20,  quote:40 },
+  pro:      { cinematic:8,  cartoon:4, productad:25, spokesperson:10, talkingphoto:10, avatarMin:4, faceless:50,  quote:100 },
+  business: { cinematic:16, cartoon:8, productad:50, spokesperson:20, talkingphoto:20, avatarMin:8, faceless:120, quote:250 }
 };
 const PAID_STATUSES = ['trialing', 'active', 'past_due'];
 function monthKey(){ return new Date().toISOString().slice(0, 7); } // 'YYYY-MM'
@@ -391,7 +391,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.1.7',
+    version: '9.2.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -1030,17 +1030,22 @@ async function cpCapture(id, freeTier){
 app.post('/api/cinematicpro/start', rateLimit(20), requireMember, async (req, res) => {
   try {
     if (!AIMLAPI_KEY) return res.status(503).json({ error: 'Cinematic Pro is not configured yet.' });
-    const { prompt, aspect, freeTier } = req.body || {};
+    const { prompt, aspect, freeTier, style } = req.body || {};
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
-    // Cinematic Pro is PAID-ONLY and monthly-capped. checkAndConsume verifies the member is a paying
-    // subscriber AND that they haven't used up this month's cinematic allowance, then consumes 1.
-    const gate = await checkAndConsume(req.memberId, 'cinematic', 1);
+    // Cartoon rides on the same Veo engine as Cinematic but with a 2D-cartoon style and its OWN monthly cap.
+    const isCartoon = (style === 'cartoon');
+    const capType = isCartoon ? 'cartoon' : 'cinematic';
+    // PAID-ONLY and monthly-capped. checkAndConsume verifies a paying subscriber AND remaining allowance.
+    const gate = await checkAndConsume(req.memberId, capType, 1);
     if (!gate.ok) return res.status(gate.code || 402).json({ error: gate.error });
     // Paid-only now, so this always uses the premium Veo 3.1 @720p engine (Lite tier). freeTier is kept for watermarking.
     const isFree = (freeTier === true);
     const model = isFree ? 'bytedance/seedance-1-5-pro' : 'google/veo-3.1-t2v';
     const resolution = isFree ? '1080p' : '720p';
-    const body = { model: model, prompt: String(prompt).slice(0, 2000), aspect_ratio: cpAspect(aspect), duration: 8, resolution: resolution, generate_audio: true };
+    const styledPrompt = isCartoon
+      ? ('2D cartoon animation, vibrant flat-color cartoon style, bold outlines, playful animated characters, smooth cartoon motion, cheerful and colorful. ' + String(prompt))
+      : String(prompt);
+    const body = { model: model, prompt: styledPrompt.slice(0, 2000), aspect_ratio: cpAspect(aspect), duration: 8, resolution: resolution, generate_audio: true };
     const r = await fetch('https://api.aimlapi.com/v2/video/generations', {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + AIMLAPI_KEY, 'Content-Type': 'application/json' },
