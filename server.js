@@ -414,7 +414,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.3.1',
+    version: '9.3.2',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -1181,19 +1181,25 @@ async function cpCapture(id, freeTier){
 app.post('/api/cinematicpro/start', rateLimit(20), requireMember, async (req, res) => {
   try {
     if (!AIMLAPI_KEY) return res.status(503).json({ error: 'Cinematic Pro is not configured yet.' });
-    const { prompt, aspect, freeTier, style, vip } = req.body || {};
+    const { prompt, aspect, freeTier, style, vip, testMode } = req.body || {};
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
     const isCartoon = (style === 'cartoon');
     const isVip = (vip === true);
+    // Admin-only test mode: run the VIP flow on the CHEAP engine with NO credit cost and NO premium ($4) charge.
+    // Gated strictly to the admin account so a normal user can never get free premium videos.
+    const isAdminTest = (isVip && testMode === true && req.memberEmail === ADMIN_EMAIL);
     let cost = 0;                 // VIP credit cost (declared here so the refund path can see it)
     let model, resolution, watermark;
-    if (isVip) {
+    if (isVip && !isAdminTest) {
       // ── VIP STUDIO: premium Veo 3.1 (the "Rolls-Royce"), paid with CREDITS (never plan caps) ──
       cost = VIP_CREDIT_COST;
       const bal = await creditsGet(req.memberId);
       if (bal < cost) return res.status(402).json({ error: 'You need ' + cost + ' credits for a VIP video (you have ' + bal + '). Buy more credits to continue.', code: 'NO_CREDITS', balance: bal, cost: cost });
       await creditsAdd(req.memberId, -cost);   // reserve the credits now; refunded below if the engine fails to start
       model = 'google/veo-3.1-t2v'; resolution = '1080p'; watermark = false;
+    } else if (isAdminTest) {
+      // ── ADMIN TEST: cheap Seedance engine, zero credits, zero premium cost — just to verify the plumbing ──
+      model = 'bytedance/seedance-1-5-pro'; resolution = '1080p'; watermark = false;
     } else {
       // ── NORMAL PLAN TYPES: cap-gated, on the cheap-but-good Seedance engine (keeps vertical + audio) ──
       const capType = isCartoon ? 'cartoon' : 'cinematic';
@@ -1216,7 +1222,7 @@ app.post('/api/cinematicpro/start', rateLimit(20), requireMember, async (req, re
       if (isVip && cost > 0) { try { await creditsAdd(req.memberId, cost); } catch (e) {} } // refund reserved credits on failure
       return res.status(502).json({ error: (d && (d.error || d.message)) ? JSON.stringify(d.error || d.message).slice(0,200) : ('AIMLAPI error ' + r.status) });
     }
-    if (isVip) vipJobs[d.id] = { uid: req.memberId, cost: cost, refunded: false }; // so a later failure auto-refunds
+    if (isVip && cost > 0) vipJobs[d.id] = { uid: req.memberId, cost: cost, refunded: false }; // so a later failure auto-refunds (skip zero-cost admin tests)
     cpCapture(d.id, watermark); // fire-and-forget background capture so the finished video is never lost
     res.json({ taskId: d.id, model: model, freeTier: watermark, vip: isVip });
   } catch (e) { cpPush({ phase: 'start_exception', err: e.message }); res.status(500).json({ error: e.message }); }
