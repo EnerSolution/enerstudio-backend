@@ -414,7 +414,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.3.0',
+    version: '9.3.1',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -869,6 +869,90 @@ app.get('/api/admin/leads', requireMember, async (req, res) => {
     leads.sort(function(a,b){ return String(b.signed_up).localeCompare(String(a.signed_up)); });
     res.json({ count: leads.length, leads: leads });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ══════════════ ADMIN MEMBER CONTROLS (grant credits, lock/unlock, change plan, reset caps) ══════════════
+// All gated: caller must be logged in AS the admin account (same pattern as /api/admin/leads).
+function adminGuard(req, res){
+  if (!req.memberEmail || req.memberEmail !== ADMIN_EMAIL) { res.status(403).json({ error: 'forbidden' }); return false; }
+  if (!SUPABASE_SERVICE_ROLE) { res.status(503).json({ error: 'not configured' }); return false; }
+  return true;
+}
+async function adminFindUserByEmail(email){
+  if (!SUPABASE_SERVICE_ROLE || !email) return null;
+  const target = String(email).trim().toLowerCase();
+  try {
+    const ur = await fetch(SUPABASE_URL_ADMIN + '/auth/v1/admin/users?per_page=200', {
+      headers: { apikey: SUPABASE_SERVICE_ROLE, Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE }
+    });
+    const ud = await ur.json().catch(function(){ return {}; });
+    const users = (ud && Array.isArray(ud.users)) ? ud.users : (Array.isArray(ud) ? ud : []);
+    return users.filter(function(u){ return (u.email || '').toLowerCase() === target; })[0] || null;
+  } catch (e){ return null; }
+}
+// Look up one member's full account
+app.post('/api/admin/member/lookup', requireMember, async (req, res) => {
+  if (!adminGuard(req, res)) return;
+  try {
+    const u = await adminFindUserByEmail((req.body && req.body.email) || '');
+    if (!u) return res.status(404).json({ error: 'No member found with that email.' });
+    const pr = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles?id=eq.' + encodeURIComponent(u.id) + '&select=plan,sub_status,sub_cycle,credits,locked,trial_used,paid_ever,usage', {
+      headers: { apikey: SUPABASE_SERVICE_ROLE, Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE }
+    });
+    const rows = pr.ok ? await pr.json() : [];
+    const p = (Array.isArray(rows) && rows[0]) ? rows[0] : {};
+    res.json({ email: u.email, id: u.id, name: (u.user_metadata && u.user_metadata.name) || '', created: u.created_at || '',
+      plan: p.plan || null, sub_status: p.sub_status || 'free', sub_cycle: p.sub_cycle || null,
+      credits: (p.credits == null ? 0 : p.credits), locked: !!p.locked, trial_used: !!p.trial_used, paid_ever: !!p.paid_ever, usage: p.usage || {} });
+  } catch (e){ res.status(500).json({ error: e.message }); }
+});
+// Grant (add) or set VIP credits
+app.post('/api/admin/member/credits', requireMember, async (req, res) => {
+  if (!adminGuard(req, res)) return;
+  try {
+    const { email, amount, mode } = req.body || {};
+    const n = parseInt(amount, 10);
+    if (!email || isNaN(n)) return res.status(400).json({ error: 'Email and a numeric amount are required.' });
+    const u = await adminFindUserByEmail(email);
+    if (!u) return res.status(404).json({ error: 'No member found with that email.' });
+    let next;
+    if (mode === 'set') { next = Math.max(0, n); await sbAdminPatchProfile('id', u.id, { credits: next }); }
+    else { next = await creditsAdd(u.id, n); } // add; negative n deducts
+    res.json({ ok: true, email: u.email, credits: next });
+  } catch (e){ res.status(500).json({ error: e.message }); }
+});
+// Lock / unlock an account
+app.post('/api/admin/member/lock', requireMember, async (req, res) => {
+  if (!adminGuard(req, res)) return;
+  try {
+    const u = await adminFindUserByEmail((req.body && req.body.email) || '');
+    if (!u) return res.status(404).json({ error: 'No member found with that email.' });
+    const locked = !!(req.body && req.body.locked);
+    await sbAdminPatchProfile('id', u.id, { locked: locked });
+    res.json({ ok: true, email: u.email, locked: locked });
+  } catch (e){ res.status(500).json({ error: e.message }); }
+});
+// Change a member's plan
+app.post('/api/admin/member/plan', requireMember, async (req, res) => {
+  if (!adminGuard(req, res)) return;
+  try {
+    const { email, plan } = req.body || {};
+    if (['starter','pro','business'].indexOf(plan) === -1) return res.status(400).json({ error: 'Plan must be starter, pro, or business.' });
+    const u = await adminFindUserByEmail(email);
+    if (!u) return res.status(404).json({ error: 'No member found with that email.' });
+    await sbAdminPatchProfile('id', u.id, { plan: plan });
+    res.json({ ok: true, email: u.email, plan: plan });
+  } catch (e){ res.status(500).json({ error: e.message }); }
+});
+// Reset this month's usage caps (a manual Plan Refresh)
+app.post('/api/admin/member/reset-usage', requireMember, async (req, res) => {
+  if (!adminGuard(req, res)) return;
+  try {
+    const u = await adminFindUserByEmail((req.body && req.body.email) || '');
+    if (!u) return res.status(404).json({ error: 'No member found with that email.' });
+    await sbAdminPatchProfile('id', u.id, { usage: {} });
+    res.json({ ok: true, email: u.email });
+  } catch (e){ res.status(500).json({ error: e.message }); }
 });
 
 // ── EMAIL FOLLOW-UP ENGINE (Resend) — every email is FROM ENZO, the face of EnerStudio ──
