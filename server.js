@@ -91,6 +91,23 @@ const PLAN_CAPS = {
 const PAID_STATUSES = ['trialing', 'active', 'past_due'];
 function monthKey(){ return new Date().toISOString().slice(0, 7); } // 'YYYY-MM'
 
+// ── VIP STUDIO CREDITS (pay-as-you-go for the premium Veo engine — separate from monthly plans) ──
+const VIP_CREDIT_COST = 6;                 // credits spent per premium VIP video (real Veo cost ~$4.16)
+const CREDIT_PACKS = {                      // one-time purchases; priced inline in Stripe (no pre-created Stripe Prices needed)
+  small:  { credits: 20,  amount: 2500,  label: '20 VIP Credits'  },   // $25.00  (~3 VIP videos)
+  medium: { credits: 50,  amount: 5500,  label: '50 VIP Credits'  },   // $55.00  (~8 VIP videos)
+  large:  { credits: 120, amount: 12000, label: '120 VIP Credits' }    // $120.00 (~20 VIP videos)
+};
+async function creditsGet(uid){
+  try { const v = await sbAdminGetProfileField(uid, 'credits'); return (v == null) ? 0 : (Number(v) || 0); } catch(e){ return 0; }
+}
+async function creditsAdd(uid, delta){
+  const cur = await creditsGet(uid);
+  const next = Math.max(0, cur + (Number(delta) || 0));
+  try { await sbAdminPatchProfile('id', uid, { credits: next }); } catch(e){}
+  return next;
+}
+
 // Check the member's plan + this month's usage for `type`, and consume `amount` if allowed.
 // Returns { ok:true } to proceed, or { ok:false, code, error } to block.
 // Fails OPEN on infrastructure errors so a Supabase blip never blocks a paying customer,
@@ -174,7 +191,13 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
   // Handle the key subscription lifecycle events — and RECORD them in Supabase profiles
   try {
     const obj = event.data && event.data.object ? event.data.object : {};
-    if (event.type === 'checkout.session.completed') {
+    if (event.type === 'checkout.session.completed' && (obj.mode === 'payment' || (obj.metadata && obj.metadata.kind === 'credits'))) {
+      // ── VIP CREDIT PACK PURCHASED (one-time payment) → add credits to the member's balance ──
+      const uid = obj.client_reference_id || (obj.metadata && obj.metadata.uid);
+      const add = obj.metadata ? parseInt(obj.metadata.credits, 10) : 0;
+      console.log('💳 Credit pack purchased:', uid, '+', add, 'credits');
+      if (uid && add > 0) { try { await creditsAdd(uid, add); } catch (e) { console.warn('creditsAdd err', e.message); } }
+    } else if (event.type === 'checkout.session.completed') {
       console.log('✅ Checkout completed:', obj.customer_email || obj.customer, '| sub:', obj.subscription);
       const uid = obj.client_reference_id;
       if (uid) {
@@ -391,7 +414,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.2.1',
+    version: '9.3.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -725,6 +748,38 @@ app.get('/api/stripe/config', (req, res) => {
   });
 });
 
+// ── VIP CREDITS: balance, buy packs, and the pack catalog ──
+app.get('/api/credits/balance', requireMember, async (req, res) => {
+  try { res.json({ credits: await creditsGet(req.memberId), vipCost: VIP_CREDIT_COST }); }
+  catch (e) { res.json({ credits: 0, vipCost: VIP_CREDIT_COST }); }
+});
+app.get('/api/credits/packs', (req, res) => {
+  const packs = Object.keys(CREDIT_PACKS).map(function(k){ return { id: k, credits: CREDIT_PACKS[k].credits, price: (CREDIT_PACKS[k].amount/100), label: CREDIT_PACKS[k].label }; });
+  res.json({ packs: packs, vipCost: VIP_CREDIT_COST });
+});
+// Create a ONE-TIME Stripe Checkout for a credit pack (priced inline — no pre-created Stripe Price needed).
+app.post('/api/credits/checkout', requireMember, async (req, res) => {
+  try {
+    if (!stripe) return res.status(503).json({ error: 'Payments are not configured yet.' });
+    const { pack, email } = req.body || {};
+    const p = CREDIT_PACKS[pack];
+    if (!p) return res.status(400).json({ error: 'Unknown credit pack' });
+    const uid = req.memberId;
+    const origin = (req.headers.origin) || 'https://app.enerstudio.io';
+    const session = await stripe.checkout.sessions.create({
+      mode: 'payment',
+      payment_method_types: ['card'],
+      line_items: [{ price_data: { currency: 'usd', product_data: { name: 'EnerStudio — ' + p.label }, unit_amount: p.amount }, quantity: 1 }],
+      customer_email: email || undefined,
+      client_reference_id: uid,
+      metadata: { kind: 'credits', credits: String(p.credits), uid: uid },
+      success_url: origin + '/?credits=success&session_id={CHECKOUT_SESSION_ID}',
+      cancel_url: origin + '/?credits=cancel'
+    });
+    res.json({ url: session.url, id: session.id });
+  } catch (e) { console.error('credits checkout error', e.message); res.status(500).json({ error: e.message }); }
+});
+
 // ── STRIPE: customer billing portal (members manage their card / invoices / cancel) ──
 app.post('/api/stripe/portal', async (req, res) => {
   try {
@@ -964,6 +1019,16 @@ app.get('/api/admin/slideshow-debug', (req, res) => {
 // Native synchronized audio → no silent gap. A server-side background capturer fetches the finished
 // video on its own even if the browser has closed, so a generated video (and its credits) is never lost.
 const cinProCache = {}; // generationId -> { done, videoId, videoData }
+const vipJobs = {};     // generationId -> { uid, cost, refunded } — so a FAILED VIP job refunds its credits exactly once
+async function vipRefund(id, reason){
+  try {
+    const j = vipJobs[id];
+    if (!j || j.refunded || !j.uid || !j.cost) return;
+    j.refunded = true;                       // mark first so concurrent error paths can't double-refund
+    await creditsAdd(j.uid, j.cost);
+    cpPush({ phase: 'vip_refund', id: id, uid: j.uid, cost: j.cost, reason: reason || '' });
+  } catch (e) { cpPush({ phase: 'vip_refund_err', id: id, err: e.message }); }
+}
 const cinProDebug = []; // ring buffer of recent AIMLAPI interactions (read via /api/cinematicpro/debug?key=ADMIN_KEY)
 function cpAspect(a){ return (a === 'vertical') ? '9:16' : (a === 'square' ? '1:1' : '16:9'); }
 function cpPush(entry){
@@ -1000,6 +1065,7 @@ async function cpFinalize(id, vurl, freeTier){
     const sz = fs.statSync(outPath).size;
     outputStore[videoId] = { path: outPath, size: sz, created: Date.now() };
     cinProCache[id] = { done: true, videoId: videoId };
+    if (vipJobs[id]) vipJobs[id].refunded = true; // video delivered → no refund owed (blocks any late timeout refund)
     cpPush({ phase: 'captured', id: id, videoId: videoId, kb: Math.round(sz/1024) });
     console.log('Cinematic Pro captured', id, '->', videoId, Math.round(sz/1024)+'KB');
     return cinProCache[id];
@@ -1020,28 +1086,37 @@ async function cpCapture(id, freeTier){
       const st = (d && (d.status || d.state)) ? String(d.status || d.state).toLowerCase() : '';
       const vurl = cpFindVid(d);
       cpPush({ phase: 'bg', i: i, http: r.status, status: st, hasVid: !!vurl, resp: JSON.stringify(d).slice(0, 500) });
-      if (st === 'error' || st === 'failed') { cpPush({ phase: 'bg_errored', id: id }); return; }
+      if (st === 'error' || st === 'failed') { cpPush({ phase: 'bg_errored', id: id }); await vipRefund(id, 'bg_errored'); return; }
       if (vurl) { try { await cpFinalize(id, vurl, freeTier); } catch (e) { cpPush({ phase: 'bg_finalize_err', err: e.message }); } return; }
     } catch (e) { cpPush({ phase: 'bg_exception', err: e.message }); }
   }
   cpPush({ phase: 'bg_timeout', id: id });
+  await vipRefund(id, 'bg_timeout'); // never let a hung VIP job silently swallow the customer's credits
 }
 
 app.post('/api/cinematicpro/start', rateLimit(20), requireMember, async (req, res) => {
   try {
     if (!AIMLAPI_KEY) return res.status(503).json({ error: 'Cinematic Pro is not configured yet.' });
-    const { prompt, aspect, freeTier, style } = req.body || {};
+    const { prompt, aspect, freeTier, style, vip } = req.body || {};
     if (!prompt) return res.status(400).json({ error: 'prompt required' });
-    // Cartoon rides on the same Veo engine as Cinematic but with a 2D-cartoon style and its OWN monthly cap.
     const isCartoon = (style === 'cartoon');
-    const capType = isCartoon ? 'cartoon' : 'cinematic';
-    // PAID-ONLY and monthly-capped. checkAndConsume verifies a paying subscriber AND remaining allowance.
-    const gate = await checkAndConsume(req.memberId, capType, 1);
-    if (!gate.ok) return res.status(gate.code || 402).json({ error: gate.error });
-    // Paid-only now, so this always uses the premium Veo 3.1 @720p engine (Lite tier). freeTier is kept for watermarking.
-    const isFree = (freeTier === true);
-    const model = isFree ? 'bytedance/seedance-1-5-pro' : 'google/veo-3.1-t2v';
-    const resolution = isFree ? '1080p' : '720p';
+    const isVip = (vip === true);
+    let cost = 0;                 // VIP credit cost (declared here so the refund path can see it)
+    let model, resolution, watermark;
+    if (isVip) {
+      // ── VIP STUDIO: premium Veo 3.1 (the "Rolls-Royce"), paid with CREDITS (never plan caps) ──
+      cost = VIP_CREDIT_COST;
+      const bal = await creditsGet(req.memberId);
+      if (bal < cost) return res.status(402).json({ error: 'You need ' + cost + ' credits for a VIP video (you have ' + bal + '). Buy more credits to continue.', code: 'NO_CREDITS', balance: bal, cost: cost });
+      await creditsAdd(req.memberId, -cost);   // reserve the credits now; refunded below if the engine fails to start
+      model = 'google/veo-3.1-t2v'; resolution = '1080p'; watermark = false;
+    } else {
+      // ── NORMAL PLAN TYPES: cap-gated, on the cheap-but-good Seedance engine (keeps vertical + audio) ──
+      const capType = isCartoon ? 'cartoon' : 'cinematic';
+      const gate = await checkAndConsume(req.memberId, capType, 1);
+      if (!gate.ok) return res.status(gate.code || 402).json({ error: gate.error });
+      model = 'bytedance/seedance-1-5-pro'; resolution = '1080p'; watermark = (freeTier === true);
+    }
     const styledPrompt = isCartoon
       ? ('2D cartoon animation, vibrant flat-color cartoon style, bold outlines, playful animated characters, smooth cartoon motion, cheerful and colorful. ' + String(prompt))
       : String(prompt);
@@ -1052,10 +1127,14 @@ app.post('/api/cinematicpro/start', rateLimit(20), requireMember, async (req, re
       body: JSON.stringify(body)
     });
     const d = await r.json().catch(function(){ return {}; });
-    cpPush({ phase: 'start', http: r.status, ok: r.ok, model: model, resolution: resolution, id: (d && d.id) || null, resp: JSON.stringify(d).slice(0, 500) });
-    if (!r.ok || !d.id) return res.status(502).json({ error: (d && (d.error || d.message)) ? JSON.stringify(d.error || d.message).slice(0,200) : ('AIMLAPI error ' + r.status) });
-    cpCapture(d.id, isFree); // fire-and-forget background capture so the finished video is never lost
-    res.json({ taskId: d.id, model: model, freeTier: isFree });
+    cpPush({ phase: 'start', http: r.status, ok: r.ok, model: model, resolution: resolution, vip: isVip, id: (d && d.id) || null, resp: JSON.stringify(d).slice(0, 500) });
+    if (!r.ok || !d.id) {
+      if (isVip && cost > 0) { try { await creditsAdd(req.memberId, cost); } catch (e) {} } // refund reserved credits on failure
+      return res.status(502).json({ error: (d && (d.error || d.message)) ? JSON.stringify(d.error || d.message).slice(0,200) : ('AIMLAPI error ' + r.status) });
+    }
+    if (isVip) vipJobs[d.id] = { uid: req.memberId, cost: cost, refunded: false }; // so a later failure auto-refunds
+    cpCapture(d.id, watermark); // fire-and-forget background capture so the finished video is never lost
+    res.json({ taskId: d.id, model: model, freeTier: watermark, vip: isVip });
   } catch (e) { cpPush({ phase: 'start_exception', err: e.message }); res.status(500).json({ error: e.message }); }
 });
 
@@ -1072,6 +1151,7 @@ app.get('/api/cinematicpro/status', requireMember, async (req, res) => {
     const vurl = cpFindVid(d);
     cpPush({ phase: 'status', http: r.status, status: rawStatus, hasVid: !!vurl, resp: JSON.stringify(d).slice(0, 500) });
     if (rawStatus === 'error' || rawStatus === 'failed') {
+      await vipRefund(id, 'status_error'); // refund VIP credits if this was a paid premium job
       return res.json({ status: 'error', error: (d && d.error) ? JSON.stringify(d.error).slice(0,200) : 'generation error' });
     }
     if (!vurl) return res.json({ status: rawStatus || 'generating' });
