@@ -391,7 +391,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.2.0',
+    version: '9.2.1',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -1075,11 +1075,14 @@ app.get('/api/cinematicpro/status', requireMember, async (req, res) => {
       return res.json({ status: 'error', error: (d && d.error) ? JSON.stringify(d.error).slice(0,200) : 'generation error' });
     }
     if (!vurl) return res.json({ status: rawStatus || 'generating' });
-    // Completed on AIMLAPI. Don't block this request downloading ~10MB — kick the (deduped) download and
-    // tell the client we're finalizing; the next poll gets the cached videoId instantly.
+    // Completed on AIMLAPI. Finalize NOW (download is a few MB, ~1-3s, well under any timeout) and hand
+    // the videoId back on THIS SAME poll — so the app never depends on making one more poll after "finalizing".
     if (cinProCache[id] && cinProCache[id].done) return res.json({ status: 'completed', videoId: cinProCache[id].videoId });
-    cpFinalize(id, vurl, freeTier).catch(function(){});
-    res.json({ status: 'finalizing' });
+    try {
+      const fin = await cpFinalize(id, vurl, freeTier);
+      if (fin && fin.videoId) return res.json({ status: 'completed', videoId: fin.videoId });
+    } catch (e) { cpPush({ phase: 'status_finalize_err', err: e.message }); }
+    res.json({ status: 'finalizing' }); // fallback: the background capturer will have it on the next poll
   } catch (e) { cpPush({ phase: 'status_exception', err: e.message }); res.status(500).json({ error: e.message }); }
 });
 
