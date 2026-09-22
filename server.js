@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execSync, execFileSync } = require('child_process');
+const { pipeline: streamPipeline } = require('stream/promises');
 const ffmpegPath = require('ffmpeg-static');
 
 const app = express();
@@ -414,7 +415,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.3.3',
+    version: '9.3.5',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -1268,19 +1269,26 @@ app.get('/api/cinematicpro/debug', (req, res) => {
 // them with ffmpeg into one file. Cost & credits scale linearly: N clips × VIP_CREDIT_COST.
 const vipMultiCache = {}; // jobId -> { done, videoId, error, clipsDone, clipsTotal, seconds }
 function vipProbeHasAudio(fp){
-  try { const out = execSync(ffmpegPath + ' -hide_banner -i ' + JSON.stringify(fp) + ' 2>&1; true', { encoding: 'utf8' }); return /Stream.*Audio:/.test(out); }
-  catch (e){ return false; }
+  // ffmpeg -i with no output exits non-zero and prints stream info to stderr → caught below (no shell needed).
+  try { execFileSync(ffmpegPath, ['-hide_banner', '-i', fp], { stdio: ['ignore', 'pipe', 'pipe'] }); return false; }
+  catch (e){ const s = ((e.stderr || '') + (e.stdout || '')).toString(); return /Stream.*Audio:/.test(s); }
 }
-// Generate ONE 8s clip end-to-end (start + poll until the mp4 url is ready). Returns the video URL.
-async function vipGenOneClip(prompt, aspect, isCartoon, useCheapEngine){
-  const model = useCheapEngine ? 'bytedance/seedance-1-5-pro' : 'google/veo-3.1-t2v';
+function vipDims(aspect){ return (aspect === 'landscape') ? [1920,1080] : (aspect === 'square' ? [1080,1080] : [1080,1920]); }
+// Admin TEST clip: a local placeholder (colorful test pattern + tone), NO AIMLAPI call → truly $0. Just proves the flow.
+function vipMakeSyntheticClip(fp, aspect){
+  const d = vipDims(aspect);
+  execFileSync(ffmpegPath, ['-y','-f','lavfi','-i','testsrc=size='+d[0]+'x'+d[1]+':rate=24:duration=8','-f','lavfi','-i','sine=frequency=440:duration=8','-threads','1','-c:v','libx264','-preset','veryfast','-pix_fmt','yuv420p','-c:a','aac','-shortest', fp], { stdio: 'ignore' });
+}
+// Generate ONE real 8s premium clip (Veo). Returns the finished mp4 URL.
+async function vipGenOneClip(prompt, aspect, isCartoon){
+  const model = 'google/veo-3.1-t2v';
   const styled = isCartoon ? ('2D cartoon animation, vibrant flat-color cartoon style, bold outlines, playful animated characters, smooth cartoon motion, cheerful and colorful. ' + String(prompt)) : String(prompt);
   const body = { model: model, prompt: styled.slice(0, 2000), aspect_ratio: cpAspect(aspect), duration: 8, resolution: '1080p', generate_audio: true };
   const r = await fetch('https://api.aimlapi.com/v2/video/generations', {
     method: 'POST', headers: { 'Authorization': 'Bearer ' + AIMLAPI_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify(body)
   });
   const d = await r.json().catch(function(){ return {}; });
-  cpPush({ phase: 'vip_clip_start', http: r.status, ok: r.ok, model: model, id: (d && d.id) || null, resp: JSON.stringify(d).slice(0, 300) });
+  cpPush({ phase: 'vip_clip_start', http: r.status, ok: r.ok, id: (d && d.id) || null, resp: JSON.stringify(d).slice(0, 300) });
   if (!r.ok || !d.id) throw new Error((d && (d.error || d.message)) ? JSON.stringify(d.error || d.message).slice(0, 200) : ('AIMLAPI error ' + r.status));
   const genId = d.id;
   for (let i = 0; i < 90; i++) {                       // up to 90 × 10s = 15 min per clip
@@ -1294,19 +1302,71 @@ async function vipGenOneClip(prompt, aspect, isCartoon, useCheapEngine){
   }
   throw new Error('clip timed out');
 }
-// Orchestrate N clips → download → stitch → store. Full refund on ANY failure.
+// Stream a URL to a file WITHOUT holding the whole video in memory (protects the small Render instance).
+async function vipDownloadToFile(url, fp){
+  const r = await fetch(url);
+  if (!r.ok || !r.body) throw new Error('download failed ' + r.status);
+  await streamPipeline(r.body, fs.createWriteStream(fp));
+}
+// MEMORY-SAFE stitch: try a stream-copy concat first (near-zero memory); if that fails, normalize each clip
+// ONE AT A TIME (one small ffmpeg at a time) then stream-copy concat. Never a 4-way re-encode (that OOM'd Render).
+function vipStitch(jobId, files, finalPath){
+  const writeList = function(tag, arr){ const lf = path.join(os.tmpdir(), jobId + tag + '_list.txt'); fs.writeFileSync(lf, arr.map(function(f){ return "file '" + f + "'"; }).join('\n')); return lf; };
+  // Attempt 1 — direct stream copy (works when all clips share codec params, which same-engine clips do)
+  try {
+    const lf = writeList('', files);
+    execFileSync(ffmpegPath, ['-y','-f','concat','-safe','0','-i',lf,'-c','copy','-movflags','+faststart', finalPath], { stdio: 'ignore' });
+    if (fs.existsSync(finalPath) && fs.statSync(finalPath).size > 2000) return;
+  } catch (e){ cpPush({ phase: 'vip_concat_copy_fail', jobId: jobId, err: (e.message||'').slice(0,120) }); }
+  // Attempt 2 — normalize each clip individually (low memory), then stream-copy concat
+  const normed = [];
+  for (let i = 0; i < files.length; i++){
+    const np = path.join(os.tmpdir(), jobId + '_norm' + i + '.mp4');
+    const base = ['-y','-i',files[i]];
+    let args;
+    if (vipProbeHasAudio(files[i])) {
+      args = base.concat(['-threads','1','-c:v','libx264','-preset','veryfast','-pix_fmt','yuv420p','-r','24','-c:a','aac','-ar','44100','-vf','scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1','-movflags','+faststart', np]);
+    } else {
+      args = ['-y','-i',files[i],'-f','lavfi','-i','anullsrc=channel_layout=stereo:sample_rate=44100','-threads','1','-map','0:v:0','-map','1:a:0','-shortest','-c:v','libx264','-preset','veryfast','-pix_fmt','yuv420p','-r','24','-c:a','aac','-vf','scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1','-movflags','+faststart', np];
+    }
+    execFileSync(ffmpegPath, args, { stdio: 'ignore' });
+    normed.push(np);
+  }
+  const lf2 = writeList('_n', normed);
+  execFileSync(ffmpegPath, ['-y','-f','concat','-safe','0','-i',lf2,'-c','copy','-movflags','+faststart', finalPath], { stdio: 'ignore' });
+  normed.forEach(function(f){ try { fs.unlinkSync(f); } catch (e){} });
+}
+// Orchestrate N clips → stitch → store. Full refund on ANY failure.
 async function vipRenderJob(jobId, opts){
   const tmp = [];
   try {
-    for (let i = 0; i < opts.nClips; i++) {
-      const vurl = await vipGenOneClip(opts.prompt, opts.aspect, opts.isCartoon, opts.cheap);
-      const vr = await fetch(vurl);
-      const buf = Buffer.from(await vr.arrayBuffer());
-      const fp = path.join(os.tmpdir(), jobId + '_raw' + i + '.mp4');
-      fs.writeFileSync(fp, buf);
-      tmp.push(fp);
-      vipMultiCache[jobId].clipsDone = i + 1;
-      cpPush({ phase: 'vip_clip_saved', jobId: jobId, i: i, kb: Math.round(buf.length / 1024) });
+    if (opts.synthetic) {
+      // Admin free test: build N local placeholder clips (no AIMLAPI, $0). Cheap + fast.
+      for (let i = 0; i < opts.nClips; i++){
+        const fp = path.join(os.tmpdir(), jobId + '_raw' + i + '.mp4');
+        vipMakeSyntheticClip(fp, opts.aspect);
+        tmp.push(fp);
+        vipMultiCache[jobId].clipsDone = i + 1;
+      }
+    } else {
+      // Real premium: generate ALL clips IN PARALLEL (network-bound, low memory) so 32s ≈ time of one clip.
+      let doneCount = 0;
+      const urls = await Promise.all(
+        Array.from({ length: opts.nClips }).map(function(){
+          return vipGenOneClip(opts.prompt, opts.aspect, opts.isCartoon).then(function(u){
+            doneCount++; vipMultiCache[jobId].clipsDone = doneCount;
+            cpPush({ phase: 'vip_clip_ready', jobId: jobId, done: doneCount, total: opts.nClips });
+            return u;
+          });
+        })
+      );
+      // Download each clip STREAMING to disk (one at a time → tiny memory footprint).
+      for (let i = 0; i < urls.length; i++) {
+        const fp = path.join(os.tmpdir(), jobId + '_raw' + i + '.mp4');
+        await vipDownloadToFile(urls[i], fp);
+        tmp.push(fp);
+        cpPush({ phase: 'vip_clip_saved', jobId: jobId, i: i, kb: Math.round((fs.existsSync(fp) ? fs.statSync(fp).size : 0) / 1024) });
+      }
     }
     const videoId = 'cp_vip_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8); // cp_ prefix → served inline & read twice
     let finalPath;
@@ -1314,25 +1374,13 @@ async function vipRenderJob(jobId, opts){
       finalPath = tmp[0];
     } else {
       finalPath = path.join(os.tmpdir(), videoId + '.mp4');
-      const allAudio = tmp.every(function(f){ return vipProbeHasAudio(f); });
-      const inputs = tmp.map(function(f){ return '-i ' + JSON.stringify(f); }).join(' ');
-      const n = tmp.length;
-      let filt, maps;
-      if (allAudio) {
-        filt = tmp.map(function(_, k){ return '[' + k + ':v][' + k + ':a]'; }).join('') + 'concat=n=' + n + ':v=1:a=1[v][a]';
-        maps = '-map "[v]" -map "[a]" -c:a aac';
-      } else {
-        filt = tmp.map(function(_, k){ return '[' + k + ':v]'; }).join('') + 'concat=n=' + n + ':v=1:a=0[v]';
-        maps = '-map "[v]"';
-      }
-      execSync(ffmpegPath + ' -y ' + inputs + ' -filter_complex "' + filt + '" ' + maps + ' -c:v libx264 -pix_fmt yuv420p -movflags +faststart ' + JSON.stringify(finalPath), { stdio: 'ignore' });
+      vipStitch(jobId, tmp, finalPath); // memory-safe; never a simultaneous multi-clip re-encode
     }
     const sz = fs.statSync(finalPath).size;
     outputStore[videoId] = { path: finalPath, size: sz, created: Date.now() };
     vipMultiCache[jobId].done = true;
     vipMultiCache[jobId].videoId = videoId;
     cpPush({ phase: 'vip_stitched', jobId: jobId, videoId: videoId, clips: opts.nClips, kb: Math.round(sz / 1024) });
-    // clean up the raw clips (keep only the final)
     tmp.forEach(function(f){ if (f !== finalPath) { try { fs.unlinkSync(f); } catch (e){} } });
   } catch (e) {
     vipMultiCache[jobId].error = e.message || 'render failed';
@@ -1357,7 +1405,7 @@ app.post('/api/vip/start', rateLimit(8), requireMember, async (req, res) => {
     }
     const jobId = 'vipjob_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
     vipMultiCache[jobId] = { done: false, clipsDone: 0, clipsTotal: nClips, seconds: nClips * 8 };
-    vipRenderJob(jobId, { prompt: prompt, aspect: aspect, isCartoon: isCartoon, nClips: nClips, cheap: isAdminTest, uid: req.memberId, refund: totalCost });
+    vipRenderJob(jobId, { prompt: prompt, aspect: aspect, isCartoon: isCartoon, nClips: nClips, synthetic: isAdminTest, uid: req.memberId, refund: totalCost });
     res.json({ jobId: jobId, clips: nClips, seconds: nClips * 8, credits: totalCost, testMode: isAdminTest });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
