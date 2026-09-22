@@ -414,7 +414,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.3.2',
+    version: '9.3.3',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -1260,6 +1260,113 @@ app.get('/api/cinematicpro/status', requireMember, async (req, res) => {
 app.get('/api/cinematicpro/debug', (req, res) => {
   if (!isAdmin(req)) return res.status(403).json({ error: 'forbidden' });
   res.json({ count: cinProDebug.length, entries: cinProDebug.slice(-40) });
+});
+
+// ══════════════ VIP MULTI-CLIP RENDER (8/16/24/32s = 1–4 stitched 8-second clips) ══════════════
+// Each AI film engine (Veo, Seedance) only produces ONE 8-second clip per call — there is no
+// "duration" the engine reads. Longer VIP videos are made by generating N clips and stitching
+// them with ffmpeg into one file. Cost & credits scale linearly: N clips × VIP_CREDIT_COST.
+const vipMultiCache = {}; // jobId -> { done, videoId, error, clipsDone, clipsTotal, seconds }
+function vipProbeHasAudio(fp){
+  try { const out = execSync(ffmpegPath + ' -hide_banner -i ' + JSON.stringify(fp) + ' 2>&1; true', { encoding: 'utf8' }); return /Stream.*Audio:/.test(out); }
+  catch (e){ return false; }
+}
+// Generate ONE 8s clip end-to-end (start + poll until the mp4 url is ready). Returns the video URL.
+async function vipGenOneClip(prompt, aspect, isCartoon, useCheapEngine){
+  const model = useCheapEngine ? 'bytedance/seedance-1-5-pro' : 'google/veo-3.1-t2v';
+  const styled = isCartoon ? ('2D cartoon animation, vibrant flat-color cartoon style, bold outlines, playful animated characters, smooth cartoon motion, cheerful and colorful. ' + String(prompt)) : String(prompt);
+  const body = { model: model, prompt: styled.slice(0, 2000), aspect_ratio: cpAspect(aspect), duration: 8, resolution: '1080p', generate_audio: true };
+  const r = await fetch('https://api.aimlapi.com/v2/video/generations', {
+    method: 'POST', headers: { 'Authorization': 'Bearer ' + AIMLAPI_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  });
+  const d = await r.json().catch(function(){ return {}; });
+  cpPush({ phase: 'vip_clip_start', http: r.status, ok: r.ok, model: model, id: (d && d.id) || null, resp: JSON.stringify(d).slice(0, 300) });
+  if (!r.ok || !d.id) throw new Error((d && (d.error || d.message)) ? JSON.stringify(d.error || d.message).slice(0, 200) : ('AIMLAPI error ' + r.status));
+  const genId = d.id;
+  for (let i = 0; i < 90; i++) {                       // up to 90 × 10s = 15 min per clip
+    await new Promise(function(r){ setTimeout(r, 10000); });
+    const pr = await fetch('https://api.aimlapi.com/v2/video/generations?generation_id=' + encodeURIComponent(genId), { headers: { 'Authorization': 'Bearer ' + AIMLAPI_KEY } });
+    const pd = await pr.json().catch(function(){ return {}; });
+    const st = (pd && (pd.status || pd.state)) ? String(pd.status || pd.state).toLowerCase() : '';
+    const vurl = cpFindVid(pd);
+    if (st === 'error' || st === 'failed') throw new Error('clip generation failed on the engine');
+    if (vurl) return vurl;
+  }
+  throw new Error('clip timed out');
+}
+// Orchestrate N clips → download → stitch → store. Full refund on ANY failure.
+async function vipRenderJob(jobId, opts){
+  const tmp = [];
+  try {
+    for (let i = 0; i < opts.nClips; i++) {
+      const vurl = await vipGenOneClip(opts.prompt, opts.aspect, opts.isCartoon, opts.cheap);
+      const vr = await fetch(vurl);
+      const buf = Buffer.from(await vr.arrayBuffer());
+      const fp = path.join(os.tmpdir(), jobId + '_raw' + i + '.mp4');
+      fs.writeFileSync(fp, buf);
+      tmp.push(fp);
+      vipMultiCache[jobId].clipsDone = i + 1;
+      cpPush({ phase: 'vip_clip_saved', jobId: jobId, i: i, kb: Math.round(buf.length / 1024) });
+    }
+    const videoId = 'cp_vip_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8); // cp_ prefix → served inline & read twice
+    let finalPath;
+    if (tmp.length === 1) {
+      finalPath = tmp[0];
+    } else {
+      finalPath = path.join(os.tmpdir(), videoId + '.mp4');
+      const allAudio = tmp.every(function(f){ return vipProbeHasAudio(f); });
+      const inputs = tmp.map(function(f){ return '-i ' + JSON.stringify(f); }).join(' ');
+      const n = tmp.length;
+      let filt, maps;
+      if (allAudio) {
+        filt = tmp.map(function(_, k){ return '[' + k + ':v][' + k + ':a]'; }).join('') + 'concat=n=' + n + ':v=1:a=1[v][a]';
+        maps = '-map "[v]" -map "[a]" -c:a aac';
+      } else {
+        filt = tmp.map(function(_, k){ return '[' + k + ':v]'; }).join('') + 'concat=n=' + n + ':v=1:a=0[v]';
+        maps = '-map "[v]"';
+      }
+      execSync(ffmpegPath + ' -y ' + inputs + ' -filter_complex "' + filt + '" ' + maps + ' -c:v libx264 -pix_fmt yuv420p -movflags +faststart ' + JSON.stringify(finalPath), { stdio: 'ignore' });
+    }
+    const sz = fs.statSync(finalPath).size;
+    outputStore[videoId] = { path: finalPath, size: sz, created: Date.now() };
+    vipMultiCache[jobId].done = true;
+    vipMultiCache[jobId].videoId = videoId;
+    cpPush({ phase: 'vip_stitched', jobId: jobId, videoId: videoId, clips: opts.nClips, kb: Math.round(sz / 1024) });
+    // clean up the raw clips (keep only the final)
+    tmp.forEach(function(f){ if (f !== finalPath) { try { fs.unlinkSync(f); } catch (e){} } });
+  } catch (e) {
+    vipMultiCache[jobId].error = e.message || 'render failed';
+    cpPush({ phase: 'vip_job_err', jobId: jobId, err: e.message });
+    if (opts.refund > 0) { try { await creditsAdd(opts.uid, opts.refund); } catch (_e){} } // full refund on failure
+    tmp.forEach(function(f){ try { fs.unlinkSync(f); } catch (_e){} });
+  }
+}
+app.post('/api/vip/start', rateLimit(8), requireMember, async (req, res) => {
+  try {
+    if (!AIMLAPI_KEY) return res.status(503).json({ error: 'VIP Studio is not configured yet.' });
+    const { prompt, aspect, style, clips, testMode } = req.body || {};
+    if (!prompt) return res.status(400).json({ error: 'Please describe your scene first.' });
+    const isCartoon = (style === 'cartoon');
+    const nClips = Math.max(1, Math.min(4, parseInt(clips, 10) || 1));
+    const isAdminTest = (testMode === true && req.memberEmail === ADMIN_EMAIL);
+    const totalCost = isAdminTest ? 0 : (VIP_CREDIT_COST * nClips);
+    if (!isAdminTest) {
+      const bal = await creditsGet(req.memberId);
+      if (bal < totalCost) return res.status(402).json({ error: 'You need ' + totalCost + ' credits for a ' + (nClips * 8) + '-second VIP video (you have ' + bal + '). Buy more credits to continue.', code: 'NO_CREDITS', balance: bal, cost: totalCost });
+      await creditsAdd(req.memberId, -totalCost); // reserve upfront; fully refunded by vipRenderJob on any failure
+    }
+    const jobId = 'vipjob_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+    vipMultiCache[jobId] = { done: false, clipsDone: 0, clipsTotal: nClips, seconds: nClips * 8 };
+    vipRenderJob(jobId, { prompt: prompt, aspect: aspect, isCartoon: isCartoon, nClips: nClips, cheap: isAdminTest, uid: req.memberId, refund: totalCost });
+    res.json({ jobId: jobId, clips: nClips, seconds: nClips * 8, credits: totalCost, testMode: isAdminTest });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/vip/status', requireMember, function(req, res){
+  const j = vipMultiCache[req.query.id];
+  if (!j) return res.json({ status: 'unknown' });
+  if (j.error) return res.json({ status: 'error', error: j.error });
+  if (j.done && j.videoId) return res.json({ status: 'completed', videoId: j.videoId, seconds: j.seconds });
+  return res.json({ status: 'rendering', clipsDone: j.clipsDone, clipsTotal: j.clipsTotal, seconds: j.seconds });
 });
 
 // ── WIZARD SAMPLE CLIP (admin-only, one-time) ──
