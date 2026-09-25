@@ -415,7 +415,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.4.1',
+    version: '9.4.2',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -3633,16 +3633,42 @@ function mzPush(e){ try { musicDebug.push(Object.assign({ t:new Date().toISOStri
 async function mzDownload(url, fp){ const r = await fetch(url); if (!r.ok || !r.body) throw new Error('download failed ' + r.status); await streamPipeline(r.body, fs.createWriteStream(fp)); }
 
 // AI songwriter — ORIGINAL lyrics only, never imitating a named/real artist.
-async function writeLyrics(topic, genre, mood, language){
+function langNote(language){
+  if (language && /farsi|persian|فارسی/i.test(language)) return ' Write in STANDARD MODERN IRANIAN PERSIAN (Tehran dialect and vocabulary) — NOT Dari, NOT Tajik, NOT Afghan Persian. Use natural Iranian word choices, idioms and spelling that an Iranian from Tehran would use.';
+  return '';
+}
+async function callClaude(sys, user, maxTokens){
   if (!ANTHROPIC_KEY) return '';
-  const sys = 'You are a professional songwriter. Output ONLY original song lyrics (a verse or two and a repeating chorus). No title, no chords, no commentary, no [section] labels. Keep it clean and radio-friendly. Never imitate, name, quote, or reference any real, living, or famous artist or their songs.';
-  const user = 'Write original song lyrics.\nGenre: ' + (genre||'pop') + '\nMood: ' + (mood||'upbeat') + '\nLanguage: ' + (language||'English') + '\nTheme: ' + (topic||'chasing your dreams and never giving up') + '\nKeep it under 18 lines total.';
   try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', { method:'POST', headers:{ 'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01' }, body: JSON.stringify({ model:'claude-sonnet-4-5', max_tokens:600, system:sys, messages:[{ role:'user', content:user }] }) });
+    const r = await fetch('https://api.anthropic.com/v1/messages', { method:'POST', headers:{ 'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01' }, body: JSON.stringify({ model:'claude-sonnet-4-5', max_tokens:maxTokens||600, system:sys, messages:[{ role:'user', content:user }] }) });
     const d = await r.json();
     return (d && d.content && d.content[0] && d.content[0].text) ? d.content[0].text.trim() : '';
   } catch(e){ return ''; }
 }
+// Write a title + lyrics in one call. Returns { title, lyrics }.
+async function writeSong(topic, genre, mood, language){
+  const sys = 'You are a professional songwriter. Write an original song. Output EXACTLY this format: first line "TITLE: <a short catchy title>", then a blank line, then the lyrics (a verse or two and a repeating chorus, under 18 lines). No chords, no [section] labels, no commentary. Keep it clean and radio-friendly. Never imitate, name, quote, or reference any real, living, or famous artist or their songs.' + langNote(language);
+  const user = 'Genre: ' + (genre||'pop') + '\nMood: ' + (mood||'upbeat') + '\nLanguage: ' + (language||'English') + '\nTheme: ' + (topic||'chasing your dreams and never giving up');
+  const out = await callClaude(sys, user, 700);
+  let title = '', lyrics = out;
+  const m = out.match(/^\s*TITLE:\s*(.+?)\s*\n/i);
+  if (m){ title = m[1].trim().replace(/^["'“”]+|["'“”]+$/g,''); lyrics = out.slice(m[0].length).trim(); }
+  return { title: title, lyrics: lyrics };
+}
+async function writeLyrics(topic, genre, mood, language){
+  const s = await writeSong(topic, genre, mood, language);
+  return s.lyrics || '';
+}
+// Free lyrics preview (Claude only — no music engine, no cap, no charge).
+app.post('/api/music/lyrics', rateLimit(30), requireMember, async (req, res) => {
+  try {
+    const { genre, mood, language, topic } = req.body || {};
+    if (!ANTHROPIC_KEY) return res.status(503).json({ error:'Lyric writer not configured.' });
+    const s = await writeSong(topic || genre, genre, mood, language);
+    if (!s.lyrics) return res.status(502).json({ error:'Could not write lyrics — try again.' });
+    res.json({ title: s.title || '', lyrics: s.lyrics });
+  } catch(e){ res.status(500).json({ error: e.message }); }
+});
 async function musicFinalize(genId, url){
   if (musicCache[genId] && musicCache[genId].done) return musicCache[genId];
   const audioId = 'cp_music_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
@@ -3681,7 +3707,7 @@ function musicSynthetic(){
 }
 app.post('/api/music/start', rateLimit(20), requireMember, async (req, res) => {
   try {
-    const { genre, mood, language, lyricsMode, lyrics, topic, vocals, instrumental, testMode } = req.body || {};
+    const { genre, mood, language, lyricsMode, lyrics, topic, vocals, instrumental, tempo, testMode } = req.body || {};
     const isAdminTest = (testMode === true && req.memberEmail === ADMIN_EMAIL);
     if (!isAdminTest){
       if (!AIMLAPI_KEY) return res.status(503).json({ error:'Music Studio is not configured yet.' });
@@ -3691,10 +3717,12 @@ app.post('/api/music/start', rateLimit(20), requireMember, async (req, res) => {
       }
     }
     const isInstr = (instrumental === true || lyricsMode === 'instrumental' || vocals === 'instrumental');
-    let core = (mood||'upbeat') + ' ' + (genre||'pop') + ' song';
-    if (!isInstr && vocals && vocals !== 'instrumental') core += ' with ' + vocals + ' vocals';
-    if (language && language !== 'English') core += ', sung in ' + language;
-    let style = ('A professional, radio-quality ' + core + ', clean modern production, clear vocals, great mix.').slice(0, 400);
+    const tempoWord = (tempo === 'slow') ? 'slow, relaxed tempo' : (tempo === 'energetic' ? 'fast, high-energy tempo' : 'steady medium tempo');
+    let core = (mood||'upbeat') + ' ' + (genre||'pop') + ' song, ' + tempoWord;
+    if (!isInstr && vocals && vocals !== 'instrumental') core += ', ' + vocals + ' vocals';
+    if (language && /farsi|persian/i.test(language)) core += ', sung in Iranian Persian with a natural Tehran accent and clear Persian pronunciation';
+    else if (language && language !== 'English') core += ', sung in ' + language;
+    let style = ('A professional, radio-quality ' + core + ', clean modern production, clear vocals, great mix.').slice(0, 500);
     let finalLyrics = '';
     if (!isInstr){
       if (lyricsMode === 'own' && lyrics && String(lyrics).trim().length >= 10) finalLyrics = String(lyrics).trim().slice(0,3000);
