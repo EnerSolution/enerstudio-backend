@@ -415,7 +415,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.4.0',
+    version: '9.4.1',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -3685,12 +3685,16 @@ app.post('/api/music/start', rateLimit(20), requireMember, async (req, res) => {
     const isAdminTest = (testMode === true && req.memberEmail === ADMIN_EMAIL);
     if (!isAdminTest){
       if (!AIMLAPI_KEY) return res.status(503).json({ error:'Music Studio is not configured yet.' });
-      const gate = await checkAndConsume(req.memberId, 'music', 1);
-      if (!gate.ok) return res.status(gate.code || 402).json({ error: gate.error });
+      if (req.memberEmail !== ADMIN_EMAIL){   // the owner/admin is exempt from the plan gate (so your own test is never blocked)
+        const gate = await checkAndConsume(req.memberId, 'music', 1);
+        if (!gate.ok) return res.status(gate.code || 402).json({ error: gate.error });
+      }
     }
     const isInstr = (instrumental === true || lyricsMode === 'instrumental' || vocals === 'instrumental');
-    let style = [genre||'pop', mood||'upbeat', (!isInstr && vocals && vocals!=='instrumental' ? vocals+' vocals' : ''), (language && language!=='English' ? ('sung in '+language) : '')].filter(Boolean).join(', ');
-    style = ('A professional, studio-quality ' + style + ' track.').slice(0, 300);
+    let core = (mood||'upbeat') + ' ' + (genre||'pop') + ' song';
+    if (!isInstr && vocals && vocals !== 'instrumental') core += ' with ' + vocals + ' vocals';
+    if (language && language !== 'English') core += ', sung in ' + language;
+    let style = ('A professional, radio-quality ' + core + ', clean modern production, clear vocals, great mix.').slice(0, 400);
     let finalLyrics = '';
     if (!isInstr){
       if (lyricsMode === 'own' && lyrics && String(lyrics).trim().length >= 10) finalLyrics = String(lyrics).trim().slice(0,3000);
