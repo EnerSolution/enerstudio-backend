@@ -85,9 +85,9 @@ async function sbAdminGetProfileBy(filterField, filterValue, select) {
 // Per-type monthly allowances. avatarMin is counted in MINUTES; everything else in videos.
 // Cheap engines (faceless/quote/slides) are intentionally generous — they cost ~pennies.
 const PLAN_CAPS = {
-  starter:  { cinematic:4,  cartoon:2, productad:10, spokesperson:5,  talkingphoto:5,  avatarMin:2, faceless:20,  quote:40 },
-  pro:      { cinematic:8,  cartoon:4, productad:25, spokesperson:10, talkingphoto:10, avatarMin:4, faceless:50,  quote:100 },
-  business: { cinematic:16, cartoon:8, productad:50, spokesperson:20, talkingphoto:20, avatarMin:8, faceless:120, quote:250 }
+  starter:  { cinematic:4,  cartoon:2, productad:10, spokesperson:5,  talkingphoto:5,  avatarMin:2, faceless:20,  quote:40,  music:10 },
+  pro:      { cinematic:8,  cartoon:4, productad:25, spokesperson:10, talkingphoto:10, avatarMin:4, faceless:50,  quote:100, music:25 },
+  business: { cinematic:16, cartoon:8, productad:50, spokesperson:20, talkingphoto:20, avatarMin:8, faceless:120, quote:250, music:60 }
 };
 const PAID_STATUSES = ['trialing', 'active', 'past_due'];
 function monthKey(){ return new Date().toISOString().slice(0, 7); } // 'YYYY-MM'
@@ -415,7 +415,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.3.5',
+    version: '9.4.0',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -3621,6 +3621,150 @@ function ensurePythonPackages() {
   }
 }
 setTimeout(() => ensurePythonPackages(), 1000);
+
+// ══════════════════════ MUSIC STUDIO + MUSIC VIDEO ══════════════════════
+// Music Studio: generate a full song (vocals) with MiniMax Music 2.6 via AIMLAPI (~$0.20/song, mp3).
+// Music Video: mux a generated song onto any video the member made (loops/trims video to the song).
+const MUSIC_MODEL = 'minimax/music-2.6';
+const musicCache = {};   // generationId -> { done, audioId, error }
+const mvCache = {};      // jobId -> { done, videoId, error }
+const musicDebug = [];
+function mzPush(e){ try { musicDebug.push(Object.assign({ t:new Date().toISOString() }, e)); while (musicDebug.length>50) musicDebug.shift(); } catch(_e){} }
+async function mzDownload(url, fp){ const r = await fetch(url); if (!r.ok || !r.body) throw new Error('download failed ' + r.status); await streamPipeline(r.body, fs.createWriteStream(fp)); }
+
+// AI songwriter — ORIGINAL lyrics only, never imitating a named/real artist.
+async function writeLyrics(topic, genre, mood, language){
+  if (!ANTHROPIC_KEY) return '';
+  const sys = 'You are a professional songwriter. Output ONLY original song lyrics (a verse or two and a repeating chorus). No title, no chords, no commentary, no [section] labels. Keep it clean and radio-friendly. Never imitate, name, quote, or reference any real, living, or famous artist or their songs.';
+  const user = 'Write original song lyrics.\nGenre: ' + (genre||'pop') + '\nMood: ' + (mood||'upbeat') + '\nLanguage: ' + (language||'English') + '\nTheme: ' + (topic||'chasing your dreams and never giving up') + '\nKeep it under 18 lines total.';
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', { method:'POST', headers:{ 'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01' }, body: JSON.stringify({ model:'claude-sonnet-4-5', max_tokens:600, system:sys, messages:[{ role:'user', content:user }] }) });
+    const d = await r.json();
+    return (d && d.content && d.content[0] && d.content[0].text) ? d.content[0].text.trim() : '';
+  } catch(e){ return ''; }
+}
+async function musicFinalize(genId, url){
+  if (musicCache[genId] && musicCache[genId].done) return musicCache[genId];
+  const audioId = 'cp_music_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+  const fp = path.join(os.tmpdir(), audioId + '.mp3');
+  await mzDownload(url, fp);
+  const sz = fs.statSync(fp).size;
+  outputStore[audioId] = { path: fp, size: sz, created: Date.now(), mp3: true, keep: true };
+  musicCache[genId] = { done: true, audioId: audioId };
+  mzPush({ phase:'captured', genId:genId, audioId:audioId, kb:Math.round(sz/1024) });
+  return musicCache[genId];
+}
+async function musicCapture(genId){
+  for (let i=0;i<80;i++){
+    await new Promise(r=>setTimeout(r,6000));
+    if (musicCache[genId] && musicCache[genId].done) return;
+    try {
+      const r = await fetch('https://api.aimlapi.com/v2/generate/audio?generation_id=' + encodeURIComponent(genId), { headers:{ Authorization:'Bearer '+AIMLAPI_KEY } });
+      const d = await r.json().catch(()=>({}));
+      const st = (d && d.status) ? String(d.status).toLowerCase() : '';
+      const url = (d && d.audio_file && d.audio_file.url) ? d.audio_file.url : null;
+      mzPush({ phase:'poll', genId:genId, status:st, hasUrl:!!url });
+      if (st==='error'||st==='failed'){ musicCache[genId] = { done:false, error:'generation failed' }; return; }
+      if (url){ try { await musicFinalize(genId, url); } catch(e){ musicCache[genId] = { done:false, error:e.message }; } return; }
+    } catch(e){ mzPush({ phase:'poll_err', err:e.message }); }
+  }
+  musicCache[genId] = Object.assign({}, musicCache[genId], { error:'timed out' });
+}
+// Admin free test: a local placeholder song (harmless tone chord, NO AIMLAPI, $0).
+function musicSynthetic(){
+  const audioId = 'cp_music_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+  const fp = path.join(os.tmpdir(), audioId + '.mp3');
+  execFileSync(ffmpegPath, ['-y','-f','lavfi','-i','sine=frequency=440:duration=20','-f','lavfi','-i','sine=frequency=554:duration=20','-filter_complex','[0][1]amix=inputs=2','-c:a','libmp3lame','-q:a','5', fp], { stdio:'ignore' });
+  const sz = fs.statSync(fp).size;
+  outputStore[audioId] = { path: fp, size: sz, created: Date.now(), mp3: true, keep: true };
+  return audioId;
+}
+app.post('/api/music/start', rateLimit(20), requireMember, async (req, res) => {
+  try {
+    const { genre, mood, language, lyricsMode, lyrics, topic, vocals, instrumental, testMode } = req.body || {};
+    const isAdminTest = (testMode === true && req.memberEmail === ADMIN_EMAIL);
+    if (!isAdminTest){
+      if (!AIMLAPI_KEY) return res.status(503).json({ error:'Music Studio is not configured yet.' });
+      const gate = await checkAndConsume(req.memberId, 'music', 1);
+      if (!gate.ok) return res.status(gate.code || 402).json({ error: gate.error });
+    }
+    const isInstr = (instrumental === true || lyricsMode === 'instrumental' || vocals === 'instrumental');
+    let style = [genre||'pop', mood||'upbeat', (!isInstr && vocals && vocals!=='instrumental' ? vocals+' vocals' : ''), (language && language!=='English' ? ('sung in '+language) : '')].filter(Boolean).join(', ');
+    style = ('A professional, studio-quality ' + style + ' track.').slice(0, 300);
+    let finalLyrics = '';
+    if (!isInstr){
+      if (lyricsMode === 'own' && lyrics && String(lyrics).trim().length >= 10) finalLyrics = String(lyrics).trim().slice(0,3000);
+      else finalLyrics = (await writeLyrics(topic||genre, genre, mood, language)).slice(0,3000);
+    }
+    if (isAdminTest){
+      const audioId = musicSynthetic();
+      const gid = 'mtest_' + Date.now();
+      musicCache[gid] = { done:true, audioId:audioId };
+      return res.json({ taskId: gid, lyrics: finalLyrics, testMode: true });
+    }
+    const body = { model: MUSIC_MODEL, prompt: style, audio_setting:{ audio_sample_rate:44100, bitrate:256000, format:'mp3' }, lyrics_optimizer:false, is_instrumental:isInstr };
+    if (!isInstr && finalLyrics && finalLyrics.length >= 10) body.lyrics = finalLyrics;
+    const r = await fetch('https://api.aimlapi.com/v2/generate/audio', { method:'POST', headers:{ Authorization:'Bearer '+AIMLAPI_KEY, 'Content-Type':'application/json' }, body: JSON.stringify(body) });
+    const d = await r.json().catch(()=>({}));
+    mzPush({ phase:'start', http:r.status, ok:r.ok, id:(d&&d.id)||null, resp:JSON.stringify(d).slice(0,300) });
+    if (!r.ok || !d.id) return res.status(502).json({ error:(d&&(d.error||d.message))?JSON.stringify(d.error||d.message).slice(0,200):('Music engine error '+r.status) });
+    musicCapture(d.id);
+    res.json({ taskId: d.id, lyrics: finalLyrics });
+  } catch(e){ mzPush({ phase:'start_ex', err:e.message }); res.status(500).json({ error:e.message }); }
+});
+app.get('/api/music/status', requireMember, async (req, res) => {
+  try {
+    const id = req.query.id; if (!id) return res.status(400).json({ error:'id required' });
+    if (musicCache[id] && musicCache[id].done) return res.json({ status:'completed', audioId:musicCache[id].audioId });
+    if (musicCache[id] && musicCache[id].error) return res.json({ status:'error', error:musicCache[id].error });
+    if (!AIMLAPI_KEY) return res.json({ status:'generating' });
+    const r = await fetch('https://api.aimlapi.com/v2/generate/audio?generation_id=' + encodeURIComponent(id), { headers:{ Authorization:'Bearer '+AIMLAPI_KEY } });
+    const d = await r.json().catch(()=>({}));
+    const st = (d && d.status) ? String(d.status).toLowerCase() : '';
+    const url = (d && d.audio_file && d.audio_file.url) ? d.audio_file.url : null;
+    if (st==='error'||st==='failed') return res.json({ status:'error', error:'generation failed' });
+    if (!url) return res.json({ status: st || 'generating' });
+    try { const fin = await musicFinalize(id, url); if (fin && fin.audioId) return res.json({ status:'completed', audioId:fin.audioId }); } catch(e){}
+    res.json({ status:'finalizing' });
+  } catch(e){ res.status(500).json({ error:e.message }); }
+});
+// MUSIC VIDEO: put a song under a video. videoId/audioId use the in-memory store; videoUrl/audioUrl (e.g. a Library link) are downloaded.
+async function mvRender(jobId, videoPath, audioPath, cleanup){
+  try {
+    const outId = 'cp_mv_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+    const outPath = path.join(os.tmpdir(), outId + '.mp4');
+    execFileSync(ffmpegPath, ['-y','-stream_loop','-1','-i',videoPath,'-i',audioPath,'-map','0:v:0','-map','1:a:0','-threads','1','-c:v','libx264','-preset','veryfast','-pix_fmt','yuv420p','-c:a','aac','-b:a','192k','-shortest','-movflags','+faststart', outPath], { stdio:'ignore' });
+    const sz = fs.statSync(outPath).size;
+    outputStore[outId] = { path: outPath, size: sz, created: Date.now(), keep: true };
+    mvCache[jobId] = { done:true, videoId:outId };
+    mzPush({ phase:'mv_done', jobId:jobId, videoId:outId, kb:Math.round(sz/1024) });
+  } catch(e){ mvCache[jobId] = { done:false, error:e.message }; mzPush({ phase:'mv_err', jobId:jobId, err:e.message }); }
+  finally { (cleanup||[]).forEach(function(f){ try { fs.unlinkSync(f); } catch(_e){} }); }
+}
+app.post('/api/musicvideo/start', rateLimit(12), requireMember, async (req, res) => {
+  try {
+    const { videoId, audioId, videoUrl, audioUrl } = req.body || {};
+    const cleanup = [];
+    let videoPath = (videoId && outputStore[videoId] && fs.existsSync(outputStore[videoId].path)) ? outputStore[videoId].path : null;
+    let audioPath = (audioId && outputStore[audioId] && fs.existsSync(outputStore[audioId].path)) ? outputStore[audioId].path : null;
+    if (!videoPath && videoUrl){ videoPath = path.join(os.tmpdir(), 'mvsrc_'+Date.now()+'.mp4'); await mzDownload(videoUrl, videoPath); cleanup.push(videoPath); }
+    if (!audioPath && audioUrl){ audioPath = path.join(os.tmpdir(), 'mvaud_'+Date.now()+'.mp3'); await mzDownload(audioUrl, audioPath); cleanup.push(audioPath); }
+    if (!videoPath) return res.status(404).json({ error:'Video not found — make or open the video, then try again.' });
+    if (!audioPath) return res.status(404).json({ error:'Song not found — generate the song, then try again.' });
+    const jobId = 'mvjob_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
+    mvCache[jobId] = { done:false };
+    mvRender(jobId, videoPath, audioPath, cleanup);
+    res.json({ jobId: jobId });
+  } catch(e){ res.status(500).json({ error:e.message }); }
+});
+app.get('/api/musicvideo/status', requireMember, (req, res) => {
+  const j = mvCache[req.query.id];
+  if (!j) return res.json({ status:'unknown' });
+  if (j.error) return res.json({ status:'error', error:j.error });
+  if (j.done && j.videoId) return res.json({ status:'completed', videoId:j.videoId });
+  res.json({ status:'rendering' });
+});
+app.get('/api/music/debug', (req, res) => { if (!isAdmin(req)) return res.status(403).json({ error:'forbidden' }); res.json({ entries: musicDebug.slice(-40) }); });
 
 app.listen(PORT, function() {
   console.log('EnerStudio Backend v8.80.0 running on port ' + PORT);
