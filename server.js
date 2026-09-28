@@ -216,6 +216,8 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
           }
         } catch (e) { console.warn('sub retrieve:', e.message); }
         await sbAdminPatchProfile('id', uid, patch);
+        // Owner alert: a card was entered / trial or subscription started.
+        try { await sendEmail(ADMIN_EMAIL, '💳 EnerStudio: trial/subscription started (' + (patch.plan || 'plan') + ')', '<p style="font-family:Arial,sans-serif;">A member just started a <b>' + (patch.sub_status || 'subscription') + '</b> on the <b>' + (patch.plan || '—') + '</b> plan.<br>Email: ' + (obj.customer_email || obj.customer || '—') + '</p>'); } catch (e) {}
       }
     } else if (event.type === 'customer.subscription.created' || event.type === 'customer.subscription.updated') {
       console.log('Subscription', event.type, obj.id, 'status:', obj.status);
@@ -415,7 +417,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.4.3',
+    version: '9.4.4',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -541,6 +543,21 @@ function applyFreeWatermark(videoPath) {
     try { fs.unlinkSync(wmPng); } catch (e) {}
     try { fs.unlinkSync(wmPy); } catch (e) {}
   }
+}
+// Decide whether a member's video should carry the watermark.
+// Policy: ONLY truly-paying members (sub_status 'active') get clean videos.
+// Free AND trialing (and past_due) get the professional watermark → protects the business and rewards conversion.
+// The account owner (admin) is always exempt.
+const hgWm = {}; // HeyGen video id -> true when that job's video must be watermarked (decided at generate time)
+async function wantsWatermark(req){
+  try {
+    if (req && req.memberEmail && req.memberEmail === ADMIN_EMAIL) return false; // owner never watermarked
+    if (req && await wantsWatermark(req)) return true;              // explicit free-tier hint
+    const mid = req && req.memberId;
+    if (!mid) return true;                                                       // unknown caller → watermark to be safe
+    const st = await sbAdminGetProfileField(mid, 'sub_status');
+    return (st !== 'active');                                                    // clean only for active (post-trial paying) members
+  } catch (e) { return true; }
 }
 
 // ── PILOT SIGNUP CAPTURE ──
@@ -972,6 +989,24 @@ async function sendEmail(to, subject, html){
     return { ok: r.ok, id: d && d.id, error: r.ok ? null : JSON.stringify(d).slice(0,200) };
   } catch(e){ return { ok:false, error:e.message }; }
 }
+// RELIABLE SIGNUP ALERT: email the owner (admin) the moment someone signs up — via Resend, not a third-party form.
+app.post('/api/notify-signup', rateLimit(20), async (req, res) => {
+  try {
+    const { name, email, company, phone, plan, cycle } = req.body || {};
+    if (!email) return res.status(400).json({ error: 'email required' });
+    const esc = function(s){ return String(s==null?'':s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); };
+    const html = '<h2 style="font-family:Arial,sans-serif;">🎉 New EnerStudio signup</h2>'
+      + '<table style="font-family:Arial,sans-serif;font-size:15px;border-collapse:collapse;">'
+      + '<tr><td style="padding:4px 10px;color:#888;">Name</td><td style="padding:4px 10px;"><b>' + esc(name||'—') + '</b></td></tr>'
+      + '<tr><td style="padding:4px 10px;color:#888;">Email</td><td style="padding:4px 10px;">' + esc(email) + '</td></tr>'
+      + '<tr><td style="padding:4px 10px;color:#888;">Company</td><td style="padding:4px 10px;">' + esc(company||'—') + '</td></tr>'
+      + '<tr><td style="padding:4px 10px;color:#888;">Phone</td><td style="padding:4px 10px;">' + esc(phone||'—') + '</td></tr>'
+      + '<tr><td style="padding:4px 10px;color:#888;">Plan</td><td style="padding:4px 10px;">' + esc(plan||'—') + ' ' + esc(cycle||'') + '</td></tr>'
+      + '</table><p style="font-family:Arial,sans-serif;color:#555;">Reach out personally — it makes all the difference for a first conversion.</p>';
+    const r = await sendEmail(ADMIN_EMAIL, '🎉 New EnerStudio signup: ' + (name || email), html);
+    res.json({ ok: !!r.ok });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 function enzoFrame(inner){
   return '<div style="font-family:Arial,Helvetica,sans-serif;max-width:520px;margin:0 auto;color:#1f2430;font-size:15px;line-height:1.6;">'
     + inner
@@ -1206,7 +1241,7 @@ app.post('/api/cinematicpro/start', rateLimit(20), requireMember, async (req, re
       const capType = isCartoon ? 'cartoon' : 'cinematic';
       const gate = await checkAndConsume(req.memberId, capType, 1);
       if (!gate.ok) return res.status(gate.code || 402).json({ error: gate.error });
-      model = 'bytedance/seedance-1-5-pro'; resolution = '1080p'; watermark = (freeTier === true);
+      model = 'bytedance/seedance-1-5-pro'; resolution = '1080p'; watermark = await wantsWatermark(req);
     }
     const styledPrompt = isCartoon
       ? ('2D cartoon animation, vibrant flat-color cartoon style, bold outlines, playful animated characters, smooth cartoon motion, cheerful and colorful. ' + String(prompt))
@@ -1953,7 +1988,7 @@ app.post('/api/runway/stitch', rateLimit(30), requireMember, async (req, res) =>
 
     const videoId = 'cin_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
     const outputPath = path.join(os.tmpdir(), videoId + '.mp4');
-    if (req.body && req.body.freeTier === true) finalPath = applyFreeWatermark(finalPath);
+    if (await wantsWatermark(req)) finalPath = applyFreeWatermark(finalPath);
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path: outputPath, size: fileSize, created: Date.now() };
@@ -2191,7 +2226,7 @@ print(f'done:{total_frames}')
     // Save to outputStore (bypasses 30s HTTP timeout)
     const videoId = 'wb_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
     const outputPath = path.join(os.tmpdir(), videoId+'.mp4');
-    if (req.body && req.body.freeTier === true) finalPath = applyFreeWatermark(finalPath);
+    if (await wantsWatermark(req)) finalPath = applyFreeWatermark(finalPath);
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
@@ -2389,6 +2424,7 @@ app.post('/api/heygen/generate', rateLimit(30), requireMember, async (req, res) 
       console.log('HeyGen generate error:', detail);
       return res.status(502).json({ error: 'HeyGen generate failed: ' + detail });
     }
+    if (vidId) { try { hgWm[vidId] = await wantsWatermark(req); } catch(e){ hgWm[vidId] = true; } }
     res.json({ videoId: vidId });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -2554,8 +2590,10 @@ app.post('/api/heygen/talkingphoto', rateLimit(30), requireMember, async (req, r
       if (!gen2.ok || !vidId2) {
         return res.status(502).json({ error: 'Talking Photo generation failed: ' + JSON.stringify(genData).slice(0, 250) });
       }
+      try { hgWm[vidId2] = await wantsWatermark(req); } catch(e){ hgWm[vidId2] = true; }
       return res.json({ videoId: vidId2, engine: 'standard' });
     }
+    try { hgWm[vidId] = await wantsWatermark(req); } catch(e){ hgWm[vidId] = true; }
     res.json({ videoId: vidId, engine: 'avatar_iv' });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -2587,12 +2625,17 @@ app.get('/api/heygen/status/:id', async (req, res) => {
         clearTimeout(to);
         const buf = Buffer.from(await vr.arrayBuffer());
         const vid = 'vid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
-        const fp = path.join(os.tmpdir(), vid + '.mp4');
+        let fp = path.join(os.tmpdir(), vid + '.mp4');
         fs.writeFileSync(fp, buf);
-        outputStore[vid] = { path: fp, size: buf.length, created: Date.now() };
+        // Trial/free members get the professional watermark (decided at generate time, keyed by HeyGen id).
+        let mark = (hgWm[req.params.id] === true);
+        if (mark) { try { const wmp = applyFreeWatermark(fp); if (wmp && wmp !== fp && fs.existsSync(wmp)) fp = wmp; else mark = false; } catch(e){ mark = false; } }
+        const finalBuf = fs.readFileSync(fp);
+        outputStore[vid] = { path: fp, size: finalBuf.length, created: Date.now() };
         let videoData = null;
-        if (buf.length < 20 * 1024 * 1024) videoData = 'data:video/mp4;base64,' + buf.toString('base64');
-        return res.json({ status: 'completed', videoId: vid, size: buf.length, videoData, heygenUrl: videoUrl });
+        if (finalBuf.length < 20 * 1024 * 1024) videoData = 'data:video/mp4;base64,' + finalBuf.toString('base64');
+        // If watermarked, DON'T hand back the raw HeyGen URL (that copy has no watermark).
+        return res.json({ status: 'completed', videoId: vid, size: finalBuf.length, videoData, heygenUrl: (mark ? null : videoUrl) });
       } catch (dlErr) {
         // download slow/failed — still give the client the playable HeyGen URL so it's never stuck
         return res.json({ status: 'completed', heygenUrl: videoUrl });
@@ -2708,7 +2751,7 @@ print('ov ok')
     // 5) store + return
     const vid = 'vid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
     const finalPath = path.join(os.tmpdir(), vid + '.mp4');
-    if (req.body && req.body.freeTier === true) finalV = applyFreeWatermark(finalV);
+    if (await wantsWatermark(req)) finalV = applyFreeWatermark(finalV);
     fs.copyFileSync(finalV, finalPath);
     const sz = fs.statSync(finalPath).size;
     outputStore[vid] = { path: finalPath, size: sz, created: Date.now() };
@@ -2785,7 +2828,7 @@ app.post('/api/spokesperson/finalize', rateLimit(30), requireMember, async (req,
     // 7) store + return
     const vidId = 'vid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
     const finalPath = path.join(os.tmpdir(), vidId + '.mp4');
-    fs.copyFileSync((req.body && req.body.freeTier === true) ? applyFreeWatermark(out) : out, finalPath);
+    fs.copyFileSync((await wantsWatermark(req)) ? applyFreeWatermark(out) : out, finalPath);
     const sz = fs.statSync(finalPath).size;
     outputStore[vidId] = { path: finalPath, size: sz, created: Date.now() };
     let videoData = null;
@@ -3078,7 +3121,7 @@ print('overlays',len(SLIDES))
         // 6) store + return
         const vid = 'vid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
         const finalPath = path.join(os.tmpdir(), vid + '.mp4');
-        if (req.body && req.body.freeTier === true) finalV = applyFreeWatermark(finalV);
+        if (await wantsWatermark(req)) finalV = applyFreeWatermark(finalV);
         fs.copyFileSync(finalV, finalPath);
         const sz = fs.statSync(finalPath).size;
         outputStore[vid] = { path: finalPath, size: sz, created: Date.now() };
@@ -3250,7 +3293,7 @@ print('overlays',len(SLIDES))
         // 6) store + return (inline if small enough)
         const vid = 'vid_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
         const finalPath = path.join(os.tmpdir(), vid + '.mp4');
-        if (req.body && req.body.freeTier === true) finalV = applyFreeWatermark(finalV);
+        if (await wantsWatermark(req)) finalV = applyFreeWatermark(finalV);
         fs.copyFileSync(finalV, finalPath);
         const sz = fs.statSync(finalPath).size;
         outputStore[vid] = { path: finalPath, size: sz, created: Date.now() };
@@ -3520,7 +3563,7 @@ print(f'done:{idx}')
 
     const videoId = 'sl_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
     const outputPath = path.join(os.tmpdir(), videoId+'.mp4');
-    if (req.body && req.body.freeTier === true) finalPath = applyFreeWatermark(finalPath);
+    if (await wantsWatermark(req)) finalPath = applyFreeWatermark(finalPath);
     fs.copyFileSync(finalPath, outputPath);
     const fileSize = fs.statSync(outputPath).size;
     outputStore[videoId] = { path:outputPath, size:fileSize, created:Date.now() };
