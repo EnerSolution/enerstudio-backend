@@ -417,7 +417,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.4.4',
+    version: '9.4.5',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -552,12 +552,63 @@ const hgWm = {}; // HeyGen video id -> true when that job's video must be waterm
 async function wantsWatermark(req){
   try {
     if (req && req.memberEmail && req.memberEmail === ADMIN_EMAIL) return false; // owner never watermarked
-    if (req && await wantsWatermark(req)) return true;              // explicit free-tier hint
+    if (req && req.body && req.body.freeTier === true) return true;              // explicit free-tier hint
     const mid = req && req.memberId;
     if (!mid) return true;                                                       // unknown caller → watermark to be safe
     const st = await sbAdminGetProfileField(mid, 'sub_status');
     return (st !== 'active');                                                    // clean only for active (post-trial paying) members
   } catch (e) { return true; }
+}
+// ── HEYGEN AUTO-SAVE SAFETY-NET ──
+// If a member leaves before their HeyGen video finishes, the browser never saves it.
+// The server polls in the background and saves it to their Library — UNLESS the browser already claimed it (no duplicates).
+const hgJobs = {}; // heygen video id -> { uid, watermark, claimed, saved }
+async function hgSaveToLibrary(uid, filePath, videoType){
+  if (!SUPABASE_SERVICE_ROLE || !uid || !filePath || !fs.existsSync(filePath)) return false;
+  try {
+    const buf = fs.readFileSync(filePath);
+    const objPath = uid + '/' + Date.now() + '_' + Math.random().toString(36).slice(2,8) + '.mp4';
+    const up = await fetch(SUPABASE_URL_ADMIN + '/storage/v1/object/library/' + objPath, {
+      method: 'POST',
+      headers: { apikey: SUPABASE_SERVICE_ROLE, Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE, 'Content-Type': 'video/mp4', 'x-upsert': 'false' },
+      body: buf
+    });
+    if (!up.ok) { console.warn('hg auto-save: storage upload failed', up.status); return false; }
+    const publicUrl = SUPABASE_URL_ADMIN + '/storage/v1/object/public/library/' + objPath;
+    const ins = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/library', {
+      method: 'POST',
+      headers: { apikey: SUPABASE_SERVICE_ROLE, Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+      body: JSON.stringify({ user_id: uid, brand: '', kind: 'video', title: (videoType || 'AI Avatar'), url: publicUrl, storage_path: objPath, meta: { videoType: (videoType || 'AI Avatar'), aspect: 'landscape', savedBy: 'auto' } })
+    });
+    if (!ins.ok) { console.warn('hg auto-save: row insert failed', ins.status); return false; }
+    console.log('HeyGen auto-saved to Library for', uid);
+    return true;
+  } catch (e) { console.warn('hgSaveToLibrary err', e.message); return false; }
+}
+async function hgCapture(videoId, videoType){
+  const job = hgJobs[videoId]; if (!job || !HEYGEN_KEY) return;
+  for (let i = 0; i < 160; i++) {                 // up to ~11 min (4s interval)
+    await new Promise(r => setTimeout(r, 4000));
+    if (job.claimed || job.saved) return;         // browser handled it → nothing to do
+    try {
+      const r = await fetch('https://api.heygen.com/v1/video_status.get?video_id=' + encodeURIComponent(videoId), { headers: { 'X-Api-Key': HEYGEN_KEY } });
+      const data = await r.json(); const d = (data && data.data) || {};
+      const st = d.status || '';
+      const vurl = d.video_url || d.video_url_caption || (d.video && d.video.url) || null;
+      if (st === 'failed') return;
+      if (st === 'completed' && vurl) {
+        // grace window: give a still-open browser ~30s to claim (save it itself) before we do.
+        for (let g = 0; g < 6 && !job.claimed && !job.saved; g++) await new Promise(r => setTimeout(r, 5000));
+        if (job.claimed || job.saved) return;
+        const vr = await fetch(vurl); const buf = Buffer.from(await vr.arrayBuffer());
+        let fp = path.join(os.tmpdir(), 'hgsave_' + videoId + '.mp4'); fs.writeFileSync(fp, buf);
+        if (hgWm[videoId] === true) { try { const w = applyFreeWatermark(fp); if (w && w !== fp && fs.existsSync(w)) fp = w; } catch (e) {} }
+        if (!job.claimed && !job.saved) { job.saved = await hgSaveToLibrary(job.uid, fp, videoType); }
+        try { fs.unlinkSync(fp); } catch (e) {}
+        return;
+      }
+    } catch (e) { /* keep polling */ }
+  }
 }
 
 // ── PILOT SIGNUP CAPTURE ──
@@ -2424,7 +2475,7 @@ app.post('/api/heygen/generate', rateLimit(30), requireMember, async (req, res) 
       console.log('HeyGen generate error:', detail);
       return res.status(502).json({ error: 'HeyGen generate failed: ' + detail });
     }
-    if (vidId) { try { hgWm[vidId] = await wantsWatermark(req); } catch(e){ hgWm[vidId] = true; } }
+    if (vidId) { try { hgWm[vidId] = await wantsWatermark(req); } catch(e){ hgWm[vidId] = true; } hgJobs[vidId] = { uid: req.memberId, claimed:false, saved:false }; hgCapture(vidId, 'AI Avatar'); }
     res.json({ videoId: vidId });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -2591,9 +2642,11 @@ app.post('/api/heygen/talkingphoto', rateLimit(30), requireMember, async (req, r
         return res.status(502).json({ error: 'Talking Photo generation failed: ' + JSON.stringify(genData).slice(0, 250) });
       }
       try { hgWm[vidId2] = await wantsWatermark(req); } catch(e){ hgWm[vidId2] = true; }
+      hgJobs[vidId2] = { uid: req.memberId, claimed:false, saved:false }; hgCapture(vidId2, 'Talking Photo');
       return res.json({ videoId: vidId2, engine: 'standard' });
     }
     try { hgWm[vidId] = await wantsWatermark(req); } catch(e){ hgWm[vidId] = true; }
+    hgJobs[vidId] = { uid: req.memberId, claimed:false, saved:false }; hgCapture(vidId, 'Talking Photo');
     res.json({ videoId: vidId, engine: 'avatar_iv' });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -2601,6 +2654,8 @@ app.post('/api/heygen/talkingphoto', rateLimit(30), requireMember, async (req, r
 });
 
 // Poll generation status; when done, download the MP4 and return inline (if small) + a local id
+// Browser says "I've saved this HeyGen video myself" → the auto-save safety-net stands down (prevents duplicates).
+app.all('/api/heygen/claim/:id', (req, res) => { const j = hgJobs[req.params.id]; if (j) j.claimed = true; res.json({ ok: true }); });
 app.get('/api/heygen/status/:id', async (req, res) => {
   if (!HEYGEN_KEY) return res.status(400).json({ error: 'HeyGen not configured' });
   try {
