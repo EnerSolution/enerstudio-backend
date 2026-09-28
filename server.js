@@ -415,7 +415,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.4.2',
+    version: '9.4.3',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -3720,8 +3720,7 @@ app.post('/api/music/start', rateLimit(20), requireMember, async (req, res) => {
     const tempoWord = (tempo === 'slow') ? 'slow, relaxed tempo' : (tempo === 'energetic' ? 'fast, high-energy tempo' : 'steady medium tempo');
     let core = (mood||'upbeat') + ' ' + (genre||'pop') + ' song, ' + tempoWord;
     if (!isInstr && vocals && vocals !== 'instrumental') core += ', ' + vocals + ' vocals';
-    if (language && /farsi|persian/i.test(language)) core += ', sung in Iranian Persian with a natural Tehran accent and clear Persian pronunciation';
-    else if (language && language !== 'English') core += ', sung in ' + language;
+    if (language && language !== 'English') core += ', sung in ' + language;
     let style = ('A professional, radio-quality ' + core + ', clean modern production, clear vocals, great mix.').slice(0, 500);
     let finalLyrics = '';
     if (!isInstr){
