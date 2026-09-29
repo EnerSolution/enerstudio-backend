@@ -417,7 +417,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.4.5',
+    version: '9.4.6',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -1366,8 +1366,8 @@ function vipMakeSyntheticClip(fp, aspect){
   execFileSync(ffmpegPath, ['-y','-f','lavfi','-i','testsrc=size='+d[0]+'x'+d[1]+':rate=24:duration=8','-f','lavfi','-i','sine=frequency=440:duration=8','-threads','1','-c:v','libx264','-preset','veryfast','-pix_fmt','yuv420p','-c:a','aac','-shortest', fp], { stdio: 'ignore' });
 }
 // Generate ONE real 8s premium clip (Veo). Returns the finished mp4 URL.
-async function vipGenOneClip(prompt, aspect, isCartoon){
-  const model = 'google/veo-3.1-t2v';
+async function vipGenOneClip(prompt, aspect, isCartoon, engine){
+  const model = (engine === 'seedance') ? 'bytedance/seedance-1-5-pro' : 'google/veo-3.1-t2v';
   const styled = isCartoon ? ('2D cartoon animation, vibrant flat-color cartoon style, bold outlines, playful animated characters, smooth cartoon motion, cheerful and colorful. ' + String(prompt)) : String(prompt);
   const body = { model: model, prompt: styled.slice(0, 2000), aspect_ratio: cpAspect(aspect), duration: 8, resolution: '1080p', generate_audio: true };
   const r = await fetch('https://api.aimlapi.com/v2/video/generations', {
@@ -1439,7 +1439,7 @@ async function vipRenderJob(jobId, opts){
       let doneCount = 0;
       const urls = await Promise.all(
         Array.from({ length: opts.nClips }).map(function(){
-          return vipGenOneClip(opts.prompt, opts.aspect, opts.isCartoon).then(function(u){
+          return vipGenOneClip(opts.prompt, opts.aspect, opts.isCartoon, opts.engine).then(function(u){
             doneCount++; vipMultiCache[jobId].clipsDone = doneCount;
             cpPush({ phase: 'vip_clip_ready', jobId: jobId, done: doneCount, total: opts.nClips });
             return u;
@@ -1462,10 +1462,26 @@ async function vipRenderJob(jobId, opts){
       finalPath = path.join(os.tmpdir(), videoId + '.mp4');
       vipStitch(jobId, tmp, finalPath); // memory-safe; never a simultaneous multi-clip re-encode
     }
+    // Normal Cinematic/Cartoon on trial/free tier → professional watermark. (VIP is never watermarked.)
+    if (opts.watermark === true) {
+      try {
+        const wmPath = applyFreeWatermark(finalPath);
+        if (wmPath && fs.existsSync(wmPath)) {
+          if (wmPath !== finalPath) { try { fs.unlinkSync(finalPath); } catch (_e){} }
+          finalPath = wmPath;
+        }
+      } catch (_wmErr){ cpPush({ phase: 'vip_wm_err', jobId: jobId, err: _wmErr.message }); }
+    }
     const sz = fs.statSync(finalPath).size;
     outputStore[videoId] = { path: finalPath, size: sz, created: Date.now() };
     vipMultiCache[jobId].done = true;
     vipMultiCache[jobId].videoId = videoId;
+    // Auto-save normal Cinematic/Cartoon to the member's library (safety-net, same as HeyGen).
+    if (opts.saveUid) {
+      try {
+        await hgSaveToLibrary(opts.saveUid, finalPath, opts.isCartoon ? 'Cartoon' : 'Cinematic AI');
+      } catch (_svErr){ cpPush({ phase: 'vip_save_err', jobId: jobId, err: _svErr.message }); }
+    }
     cpPush({ phase: 'vip_stitched', jobId: jobId, videoId: videoId, clips: opts.nClips, kb: Math.round(sz / 1024) });
     tmp.forEach(function(f){ if (f !== finalPath) { try { fs.unlinkSync(f); } catch (e){} } });
   } catch (e) {
@@ -1478,11 +1494,28 @@ async function vipRenderJob(jobId, opts){
 app.post('/api/vip/start', rateLimit(8), requireMember, async (req, res) => {
   try {
     if (!AIMLAPI_KEY) return res.status(503).json({ error: 'VIP Studio is not configured yet.' });
-    const { prompt, aspect, style, clips, testMode } = req.body || {};
+    const { prompt, aspect, style, clips, testMode, normal } = req.body || {};
     if (!prompt) return res.status(400).json({ error: 'Please describe your scene first.' });
     const isCartoon = (style === 'cartoon');
     const nClips = Math.max(1, Math.min(4, parseInt(clips, 10) || 1));
     const isAdminTest = (testMode === true && req.memberEmail === ADMIN_EMAIL);
+
+    // ── NORMAL Cinematic / Cartoon (multi-clip, honors selected duration) ──
+    // Uses the cheap Seedance engine, gated by the member's PLAN CAP (not VIP credits),
+    // and stitches N × 8s clips into the length the member actually chose.
+    if (normal === true) {
+      if (!isAdminTest) {
+        const capType = isCartoon ? 'cartoon' : 'cinematic';
+        const gate = await checkAndConsume(req.memberId, capType, 1);
+        if (!gate.ok) return res.status(gate.code || 402).json(gate);
+      }
+      const wm = await wantsWatermark(req);
+      const jobId = 'nrmjob_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+      vipMultiCache[jobId] = { done: false, clipsDone: 0, clipsTotal: nClips, seconds: nClips * 8 };
+      vipRenderJob(jobId, { prompt: prompt, aspect: aspect, isCartoon: isCartoon, nClips: nClips, engine: 'seedance', synthetic: isAdminTest, watermark: wm, saveUid: req.memberId, uid: req.memberId, refund: 0 });
+      return res.json({ jobId: jobId, clips: nClips, seconds: nClips * 8, normal: true });
+    }
+
     const totalCost = isAdminTest ? 0 : (VIP_CREDIT_COST * nClips);
     if (!isAdminTest) {
       const bal = await creditsGet(req.memberId);
@@ -1491,7 +1524,7 @@ app.post('/api/vip/start', rateLimit(8), requireMember, async (req, res) => {
     }
     const jobId = 'vipjob_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
     vipMultiCache[jobId] = { done: false, clipsDone: 0, clipsTotal: nClips, seconds: nClips * 8 };
-    vipRenderJob(jobId, { prompt: prompt, aspect: aspect, isCartoon: isCartoon, nClips: nClips, synthetic: isAdminTest, uid: req.memberId, refund: totalCost });
+    vipRenderJob(jobId, { prompt: prompt, aspect: aspect, isCartoon: isCartoon, nClips: nClips, engine: 'veo', synthetic: isAdminTest, uid: req.memberId, refund: totalCost });
     res.json({ jobId: jobId, clips: nClips, seconds: nClips * 8, credits: totalCost, testMode: isAdminTest });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
