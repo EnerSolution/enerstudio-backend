@@ -417,7 +417,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.4.6',
+    version: '9.4.7',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -1292,11 +1292,12 @@ app.post('/api/cinematicpro/start', rateLimit(20), requireMember, async (req, re
       const capType = isCartoon ? 'cartoon' : 'cinematic';
       const gate = await checkAndConsume(req.memberId, capType, 1);
       if (!gate.ok) return res.status(gate.code || 402).json({ error: gate.error });
-      model = 'bytedance/seedance-1-5-pro'; resolution = '1080p'; watermark = await wantsWatermark(req);
+      model = 'google/veo-3.1-t2v-fast'; resolution = '1080p'; watermark = await wantsWatermark(req);
     }
-    const styledPrompt = isCartoon
+    const NO_TEXT_LEGACY = ' IMPORTANT: Do NOT render any readable text, letters, words, captions, subtitles, signs, logos, labels, or writing on papers, screens, or objects anywhere in the video. Keep all documents, screens, signs and surfaces completely blank and text-free. No fake or gibberish lettering of any kind.';
+    const styledPrompt = (isCartoon
       ? ('2D cartoon animation, vibrant flat-color cartoon style, bold outlines, playful animated characters, smooth cartoon motion, cheerful and colorful. ' + String(prompt))
-      : String(prompt);
+      : String(prompt)) + NO_TEXT_LEGACY;
     const body = { model: model, prompt: styledPrompt.slice(0, 2000), aspect_ratio: cpAspect(aspect), duration: 8, resolution: resolution, generate_audio: true };
     const r = await fetch('https://api.aimlapi.com/v2/video/generations', {
       method: 'POST',
@@ -1367,8 +1368,17 @@ function vipMakeSyntheticClip(fp, aspect){
 }
 // Generate ONE real 8s premium clip (Veo). Returns the finished mp4 URL.
 async function vipGenOneClip(prompt, aspect, isCartoon, engine){
-  const model = (engine === 'seedance') ? 'bytedance/seedance-1-5-pro' : 'google/veo-3.1-t2v';
-  const styled = isCartoon ? ('2D cartoon animation, vibrant flat-color cartoon style, bold outlines, playful animated characters, smooth cartoon motion, cheerful and colorful. ' + String(prompt)) : String(prompt);
+  // Engine map: 'seedance' = cheapest (weak realism/text); 'veofast' = Veo 3.1 Fast (great realism + native audio, low cost);
+  //             default/'veo' = Veo 3.1 Standard (top-tier, for VIP paid-with-credits).
+  const model = (engine === 'seedance') ? 'bytedance/seedance-1-5-pro'
+              : (engine === 'veofast') ? 'google/veo-3.1-t2v-fast'
+              : 'google/veo-3.1-t2v';
+  // CRITICAL: AI video engines cannot reliably spell on-screen text — papers, signs and labels come out as garbled
+  // fake letters. So we instruct the engine to keep every surface CLEAN and text-free. Real, correctly-spelled text
+  // (business name, phone, call-to-action) is added afterward as a crisp post-production overlay we fully control.
+  const NO_TEXT = ' IMPORTANT: Do NOT render any readable text, letters, words, captions, subtitles, signs, logos, labels, or writing on papers, screens, or objects anywhere in the video. Keep all documents, screens, signs and surfaces completely blank and text-free. No fake or gibberish lettering of any kind.';
+  const base = isCartoon ? ('2D cartoon animation, vibrant flat-color cartoon style, bold outlines, playful animated characters, smooth cartoon motion, cheerful and colorful. ' + String(prompt)) : String(prompt);
+  const styled = base + NO_TEXT;
   const body = { model: model, prompt: styled.slice(0, 2000), aspect_ratio: cpAspect(aspect), duration: 8, resolution: '1080p', generate_audio: true };
   const r = await fetch('https://api.aimlapi.com/v2/video/generations', {
     method: 'POST', headers: { 'Authorization': 'Bearer ' + AIMLAPI_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify(body)
@@ -1501,8 +1511,8 @@ app.post('/api/vip/start', rateLimit(8), requireMember, async (req, res) => {
     const isAdminTest = (testMode === true && req.memberEmail === ADMIN_EMAIL);
 
     // ── NORMAL Cinematic / Cartoon (multi-clip, honors selected duration) ──
-    // Uses the cheap Seedance engine, gated by the member's PLAN CAP (not VIP credits),
-    // and stitches N × 8s clips into the length the member actually chose.
+    // Runs on Veo 3.1 FAST — far more photorealistic than the old Seedance engine, with native audio, at a low
+    // per-clip cost. Gated by the member's PLAN CAP (not VIP credits). Stitches N × 8s clips into the chosen length.
     if (normal === true) {
       if (!isAdminTest) {
         const capType = isCartoon ? 'cartoon' : 'cinematic';
@@ -1512,7 +1522,7 @@ app.post('/api/vip/start', rateLimit(8), requireMember, async (req, res) => {
       const wm = await wantsWatermark(req);
       const jobId = 'nrmjob_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
       vipMultiCache[jobId] = { done: false, clipsDone: 0, clipsTotal: nClips, seconds: nClips * 8 };
-      vipRenderJob(jobId, { prompt: prompt, aspect: aspect, isCartoon: isCartoon, nClips: nClips, engine: 'seedance', synthetic: isAdminTest, watermark: wm, saveUid: req.memberId, uid: req.memberId, refund: 0 });
+      vipRenderJob(jobId, { prompt: prompt, aspect: aspect, isCartoon: isCartoon, nClips: nClips, engine: 'veofast', synthetic: isAdminTest, watermark: wm, saveUid: req.memberId, uid: req.memberId, refund: 0 });
       return res.json({ jobId: jobId, clips: nClips, seconds: nClips * 8, normal: true });
     }
 
