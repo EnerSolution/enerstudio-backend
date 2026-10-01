@@ -81,6 +81,28 @@ async function sbAdminGetProfileBy(filterField, filterValue, select) {
   } catch (e) { return null; }
 }
 
+// ── SECURITY: disposable / throwaway email blocklist ──
+// Blocks the kind of junk signups we saw (e.g. uberip.com) from starting a trial or burning free generations.
+// NOTE: real Apple "Hide My Email" (icloud.com / privaterelay.appleid.com) is NOT blocked — those are legit users.
+const DISPOSABLE_EMAIL_DOMAINS = new Set([
+  'uberip.com','mailinator.com','guerrillamail.com','guerrillamail.info','grr.la','sharklasers.com',
+  '10minutemail.com','10minutemail.net','yopmail.com','yopmail.fr','trashmail.com','trashmail.net',
+  'getnada.com','nada.email','dispostable.com','maildrop.cc','temp-mail.org','tempmail.com','tempmail.net',
+  'fakeinbox.com','throwawaymail.com','mytemp.email','mohmal.com','emailondeck.com','mailnesia.com',
+  'tempinbox.com','spam4.me','moakt.com','tmail.io','burnermail.io','inboxbear.com','mailsac.com',
+  'discard.email','mintemail.com','spambox.us','tempmailo.com','luxusmail.org','harakirimail.com'
+]);
+function emailDomain(email){
+  try { return String(email || '').trim().toLowerCase().split('@')[1] || ''; } catch(e){ return ''; }
+}
+function isDisposableEmail(email){
+  const d = emailDomain(email);
+  if (!d) return false;
+  if (DISPOSABLE_EMAIL_DOMAINS.has(d)) return true;
+  // Heuristic catch-all for obvious throwaway brand tokens appearing anywhere in the domain.
+  return /(tempmail|temp-mail|throwaway|trashmail|guerrillamail|mailinator|yopmail|10minutemail|sharklasers|getnada|fakeinbox|discardmail|dispostable|maildrop)/.test(d);
+}
+
 // ── PLAN LIMITS (server-side, authoritative) ──
 // Per-type monthly allowances. avatarMin is counted in MINUTES; everything else in videos.
 // Cheap engines (faceless/quote/slides) are intentionally generous — they cost ~pennies.
@@ -125,7 +147,9 @@ async function checkAndConsume(memberId, type, amount) {
     const rows = await r.json();
     p = (Array.isArray(rows) && rows[0]) ? rows[0] : null;
   } catch (e) { return { ok: true }; } // network error → fail open
-  if (!p) return { ok: true };
+  // No profile row = no entitlement. Block (fail CLOSED here): a real member always has a profile from signup,
+  // so a missing row means either a non-member or a tampered/orphan account — it must NOT get free generations.
+  if (!p) return { ok: false, code: 402, error: 'This feature requires an active plan. Please upgrade to keep creating.' };
   if (p.locked === true) {
     return { ok: false, code: 402, locked: true, error: 'Your trial has ended. Subscribe to reactivate your account and keep creating.' };
   }
@@ -417,7 +441,7 @@ app.get('/api/video/:id/status', (req, res) => {
 app.get('/', (req, res) => {
   res.json({ 
     status: 'EnerStudio Backend Running', 
-    version: '9.4.7',
+    version: '9.4.8',
     ffmpeg: ffmpegPath ? 'available' : 'missing'
   });
 });
@@ -777,19 +801,28 @@ app.all('/api/auto/cron', requireMember, async (req, res) => {
 });
 
 // ── STRIPE: create a Checkout Session (card up front, 7-day trial) ──
-app.post('/api/stripe/create-checkout', async (req, res) => {
+app.post('/api/stripe/create-checkout', rateLimit(12), requireMember, async (req, res) => {
   try {
     if (!stripe) return res.status(503).json({ error: 'Payments are not configured yet. Please try again shortly.' });
-    const { plan, cycle, email, uid, successUrl, cancelUrl } = req.body || {};
+    const { plan, cycle, successUrl, cancelUrl } = req.body || {};
+    // Identity comes from the VERIFIED login token — never from the request body (stops uid/email spoofing of the trial check).
+    const uid = req.memberId;
+    const email = req.memberEmail || '';
     const key = (plan || '') + '_' + (cycle || '');
     const priceId = STRIPE_PRICES[key];
     if (!priceId) return res.status(400).json({ error: 'Unknown plan/cycle: ' + key });
     const origin = (req.headers.origin) || 'https://app.enerstudio.io';
     // One free trial per account, ever. If this account already used its trial (or a fraud/decline locked it),
-    // they subscribe and pay immediately — no second free trial on the same email.
-    let trialUsed = false;
-    if (uid) { try { trialUsed = (await sbAdminGetProfileField(uid, 'trial_used')) === true; } catch (e) {} }
-    const subData = trialUsed ? {} : { trial_period_days: TRIAL_DAYS };
+    // they subscribe and pay immediately — no second free trial on the same account.
+    let trialUsed = false, locked = false;
+    try {
+      const prof = await sbAdminGetProfileBy('id', uid, 'trial_used,locked');
+      trialUsed = !!(prof && prof.trial_used === true);
+      locked = !!(prof && prof.locked === true);
+    } catch (e) {}
+    // Disposable/junk email OR a previously-locked (fraud/decline) account → NO free trial, ever. They may still subscribe and pay.
+    const noTrial = trialUsed || locked || isDisposableEmail(email);
+    const subData = noTrial ? {} : { trial_period_days: TRIAL_DAYS };
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
       payment_method_types: ['card'],
@@ -850,14 +883,15 @@ app.post('/api/credits/checkout', requireMember, async (req, res) => {
 });
 
 // ── STRIPE: customer billing portal (members manage their card / invoices / cancel) ──
-app.post('/api/stripe/portal', async (req, res) => {
+app.post('/api/stripe/portal', rateLimit(12), requireMember, async (req, res) => {
   try {
     if (!stripe) return res.status(503).json({ error: 'Payments are not configured yet.' });
-    const { uid, email, returnUrl } = req.body || {};
-    let customerId = null;
-    if (uid) customerId = await sbAdminGetProfileField(uid, 'stripe_customer');
-    if (!customerId && email) {
-      const found = await stripe.customers.list({ email: email, limit: 1 });
+    const { returnUrl } = req.body || {};
+    // SECURITY: only ever open the billing portal for the LOGGED-IN member's own Stripe customer.
+    // (Previously trusted uid/email from the body — a stranger could open someone else's billing by email.)
+    let customerId = await sbAdminGetProfileField(req.memberId, 'stripe_customer');
+    if (!customerId && req.memberEmail) {
+      const found = await stripe.customers.list({ email: req.memberEmail, limit: 1 });
       if (found && found.data && found.data[0]) customerId = found.data[0].id;
     }
     if (!customerId) return res.status(404).json({ error: 'No billing account found for this member yet.' });
@@ -1040,6 +1074,39 @@ async function sendEmail(to, subject, html){
     return { ok: r.ok, id: d && d.id, error: r.ok ? null : JSON.stringify(d).slice(0,200) };
   } catch(e){ return { ok:false, error:e.message }; }
 }
+// ── SECURE PROFILE CREATION ──
+// The browser must NOT write the profiles table directly (a user could forge sub_status/credits/plan there).
+// All profile creation goes through here, server-side, with the SERVICE ROLE and a strict column whitelist:
+// the caller can only ever set their OWN contact details — never sub_status, credits, locked, trial_used, paid_ever.
+app.post('/api/profile/init', rateLimit(20), requireMember, async (req, res) => {
+  try {
+    if (!SUPABASE_SERVICE_ROLE) return res.json({ ok: true, note: 'not configured' });
+    const uid = req.memberId;
+    const email = req.memberEmail || '';
+    const b = req.body || {};
+    const clean = function(s){ return (s == null ? '' : String(s)).slice(0, 200); };
+    const name = clean(b.name), company = clean(b.company), phone = clean(b.phone);
+    const planPref = (['starter','pro','business'].indexOf(b.plan) !== -1) ? b.plan : null; // harmless label only
+    // Does a row already exist? If so, only ever touch contact fields — never entitlement columns.
+    const existing = await sbAdminGetProfileBy('id', uid, 'id,sub_status');
+    if (existing) {
+      await sbAdminPatchProfile('id', uid, { email: email, name: name, company: company, phone: phone });
+      return res.json({ ok: true, existing: true });
+    }
+    // New row: insert contact details + the ALWAYS-safe defaults. Entitlement stays 'free' until the Stripe webhook upgrades it.
+    const row = { id: uid, email: email, name: name, company: company, phone: phone, sub_status: 'free' };
+    if (planPref) row.plan = planPref;
+    // Junk/disposable email → create the row but LOCK it so it can't burn free generations or start a trial.
+    if (isDisposableEmail(email)) { row.locked = true; }
+    const r = await fetch(SUPABASE_URL_ADMIN + '/rest/v1/profiles', {
+      method: 'POST',
+      headers: { apikey: SUPABASE_SERVICE_ROLE, Authorization: 'Bearer ' + SUPABASE_SERVICE_ROLE, 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' },
+      body: JSON.stringify(row)
+    });
+    if (!r.ok) { const t = await r.text().catch(function(){ return ''; }); console.warn('profile/init insert failed', r.status, t.slice(0,160)); }
+    return res.json({ ok: true, created: true });
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+});
 // RELIABLE SIGNUP ALERT: email the owner (admin) the moment someone signs up — via Resend, not a third-party form.
 app.post('/api/notify-signup', rateLimit(20), async (req, res) => {
   try {
